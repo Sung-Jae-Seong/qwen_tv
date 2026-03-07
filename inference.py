@@ -21,7 +21,7 @@ def parse_in_json(llm_response, video_path):
     try:
         temp = ast.literal_eval(llm_response)
     except Exception:
-        return {
+        temp = {
             "time": 0.0,
             "coordinate": [[0, 0], [0, 0]],
             "type": "head-on",
@@ -29,7 +29,7 @@ def parse_in_json(llm_response, video_path):
         }
 
     if not isinstance(temp, dict):
-        return {
+        temp = {
             "time": 0.0,
             "coordinate": [[0, 0], [0, 0]],
             "type": "head-on",
@@ -69,31 +69,34 @@ def make_submission(results):
     rows = []
 
     for result in results:
-        video_path = result.get("video_path", "")
-        path = "videos/" + video_path.split("/videos/")[-1] if "/videos/" in video_path else video_path
+        try:
+            video_path = result.get("video_path", "")
+            path = "videos/" + video_path.split("/videos/")[-1] if "/videos/" in video_path else video_path
 
-        accident_time = result.get("time", 0.0)
-        coordinate = result.get("coordinate", [[0, 0], [0, 0]])
-        (x1, y1), (x2, y2) = coordinate
+            accident_time = result.get("time", 0.0)
+            coordinate = result.get("coordinate", [[0, 0], [0, 0]])
+            (x1, y1), (x2, y2) = coordinate
 
-        center_x = round(((x1 + x2) / 2) / 1000, 3)
-        center_y = round(((y1 + y2) / 2) / 1000, 3)
-        accident_type = result.get("type", "unknown")
+            center_x = round(((x1 + x2) / 2) / 1000, 3)
+            center_y = round(((y1 + y2) / 2) / 1000, 3)
+            accident_type = result.get("type", "unknown")
 
-        rows.append({
-            "path": path,
-            "accident_time": round(accident_time, 2),
-            "center_x": center_x,
-            "center_y": center_y,
-            "type": accident_type
-        })
+            rows.append({
+                "path": path,
+                "accident_time": round(accident_time, 2),
+                "center_x": center_x,
+                "center_y": center_y,
+                "type": accident_type
+            })
 
-    submission = pd.DataFrame(
-        rows,
-        columns=["path", "accident_time", "center_x", "center_y", "type"]
-    )
-    return submission
-
+            submission = pd.DataFrame(
+                rows,
+                columns=["path", "accident_time", "center_x", "center_y", "type"]
+            )
+            return submission
+        except Exception as e:
+            print(f"failed to make submission for result: {result}, error: {e}")
+            return pd.DataFrame(columns=["path", "accident_time", "center_x", "center_y", "type"])
 
 class VideoInferenceVLM:
     def video_inference(self, video_path, prompt, max_new_tokens=128):
@@ -242,7 +245,7 @@ example:
     with open(test_path_file, "r", encoding="utf-8") as f:
         video_paths = [line.strip() for line in f if line.strip()]
 
-    total_videos = len(video_paths)
+    total_videos = len(video_paths[:4])
     mid = total_videos // 2
 
     output_queue = mp.Queue()
@@ -269,32 +272,7 @@ example:
     total_end_time = time.time()
     total_elapsed_seconds = total_end_time - total_start_time
 
-    errors = [x for x in worker_outputs if x["error"] is not None]
-    if len(errors) > 0:
-        raise RuntimeError(str(errors))
-
-    merged_results = []
-    for worker_output in worker_outputs:
-        merged_results.extend(worker_output["results"])
-
-    merged_results.sort(key=lambda x: x[0])
-    final_results = [result for _, result in merged_results]
-
-    submission = make_submission(final_results)
-
-    description_lines = [
-        f"total_videos: {total_videos}",
-        f"total_elapsed_seconds: {total_elapsed_seconds:.4f}"
-    ]
-
-    for worker_output in sorted(worker_outputs, key=lambda x: x["gpu_id"]):
-        description_lines.append(
-            f"gpu{worker_output['gpu_id']}_elapsed_seconds: {worker_output['elapsed_seconds']:.4f}"
-        )
-
-    description_text = "\n".join(description_lines) + "\n"
-
-    save_submission(submission, "qwen3_vl_experiment_2gpu", description_text)
+    print(f"Total elapsed time: {total_elapsed_seconds:.2f} seconds")
 
 
 if __name__ == "__main__":

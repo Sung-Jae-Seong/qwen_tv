@@ -6,3 +6,6 @@ data_analysis/
 output.log
 __pycache__/
 *.pyc
+prev/
+qwen3_for_time.ipynb
+build_submission_from_parsed_json.py
