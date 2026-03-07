@@ -1,5 +1,6 @@
 import os
 import ast
+import json
 import time
 import multiprocessing as mp
 from datetime import datetime
@@ -16,7 +17,7 @@ hf_token = os.getenv("HF_TOKEN")
 login(token=hf_token)
 
 
-def parse_in_json(llm_response):
+def parse_in_json(llm_response, video_path):
     try:
         temp = ast.literal_eval(llm_response)
     except Exception:
@@ -34,6 +35,16 @@ def parse_in_json(llm_response):
             "type": "head-on",
             "why": "invalid response format"
         }
+
+    save_dir = os.path.join("result", "parsed_json")
+    os.makedirs(save_dir, exist_ok=True)
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    save_path = os.path.join(save_dir, f"{video_name}.json")
+    try:
+        with open(save_path, "w", encoding="utf-8") as f:
+            json.dump(temp, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"failed to save parsed json for {video_path}: {e}", flush=True)
 
     return temp
 
@@ -161,7 +172,7 @@ def worker_process(gpu_id, start_idx, end_idx, video_paths, prompt, output_queue
                 prompt,
                 max_new_tokens=128
             )
-            output_json = parse_in_json(output[0])
+            output_json = parse_in_json(output[0], video_path)
             output_json["video_path"] = video_path
             results.append((i, output_json))
             print(f"gpu {gpu_id} - {i + 1}/{len(video_paths)} is done.", flush=True)

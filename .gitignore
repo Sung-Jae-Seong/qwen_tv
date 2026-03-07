@@ -4,3 +4,5 @@ result/
 memo
 data_analysis/
 output.log
+__pycache__/
+*.pyc
