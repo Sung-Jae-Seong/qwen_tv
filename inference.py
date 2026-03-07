@@ -61,7 +61,7 @@ def make_submission(results):
         video_path = result.get("video_path", "")
         path = "videos/" + video_path.split("/videos/")[-1] if "/videos/" in video_path else video_path
 
-        accident_time = float(result.get("time", 0.0))
+        accident_time = result.get("time", 0.0)
         coordinate = result.get("coordinate", [[0, 0], [0, 0]])
         (x1, y1), (x2, y2) = coordinate
 
@@ -215,7 +215,7 @@ here is the JSON format:
 ---
 example:
 {
-    "time": "mm.ss",
+    "time": "second.milisecond", # do not return time in hh:mm:ss format, for example, if the collision occurs at 1 second and 500 milliseconds, please return 1.5
     "coordinate": [
         [x1, y1],
         [x2, y2]
