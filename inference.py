@@ -1,5 +1,6 @@
 import os
 import ast
+import json
 import time
 import multiprocessing as mp
 from datetime import datetime
@@ -16,11 +17,11 @@ hf_token = os.getenv("HF_TOKEN")
 login(token=hf_token)
 
 
-def parse_in_json(llm_response):
+def parse_in_json(llm_response, video_path):
     try:
         temp = ast.literal_eval(llm_response)
     except Exception:
-        return {
+        temp = {
             "time": 0.0,
             "coordinate": [[0, 0], [0, 0]],
             "type": "head-on",
@@ -28,12 +29,22 @@ def parse_in_json(llm_response):
         }
 
     if not isinstance(temp, dict):
-        return {
+        temp = {
             "time": 0.0,
             "coordinate": [[0, 0], [0, 0]],
             "type": "head-on",
             "why": "invalid response format"
         }
+
+    save_dir = os.path.join("result", "parsed_json")
+    os.makedirs(save_dir, exist_ok=True)
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    save_path = os.path.join(save_dir, f"{video_name}.json")
+    try:
+        with open(save_path, "w", encoding="utf-8") as f:
+            json.dump(temp, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"failed to save parsed json for {video_path}: {e}", flush=True)
 
     return temp
 
@@ -58,31 +69,34 @@ def make_submission(results):
     rows = []
 
     for result in results:
-        video_path = result.get("video_path", "")
-        path = "videos/" + video_path.split("/videos/")[-1] if "/videos/" in video_path else video_path
+        try:
+            video_path = result.get("video_path", "")
+            path = "videos/" + video_path.split("/videos/")[-1] if "/videos/" in video_path else video_path
 
-        accident_time = float(result.get("time", 0.0))
-        coordinate = result.get("coordinate", [[0, 0], [0, 0]])
-        (x1, y1), (x2, y2) = coordinate
+            accident_time = result.get("time", 0.0)
+            coordinate = result.get("coordinate", [[0, 0], [0, 0]])
+            (x1, y1), (x2, y2) = coordinate
 
-        center_x = round(((x1 + x2) / 2) / 1000, 3)
-        center_y = round(((y1 + y2) / 2) / 1000, 3)
-        accident_type = result.get("type", "unknown")
+            center_x = round(((x1 + x2) / 2) / 1000, 3)
+            center_y = round(((y1 + y2) / 2) / 1000, 3)
+            accident_type = result.get("type", "unknown")
 
-        rows.append({
-            "path": path,
-            "accident_time": round(accident_time, 2),
-            "center_x": center_x,
-            "center_y": center_y,
-            "type": accident_type
-        })
+            rows.append({
+                "path": path,
+                "accident_time": round(accident_time, 2),
+                "center_x": center_x,
+                "center_y": center_y,
+                "type": accident_type
+            })
 
-    submission = pd.DataFrame(
-        rows,
-        columns=["path", "accident_time", "center_x", "center_y", "type"]
-    )
-    return submission
-
+            submission = pd.DataFrame(
+                rows,
+                columns=["path", "accident_time", "center_x", "center_y", "type"]
+            )
+            return submission
+        except Exception as e:
+            print(f"failed to make submission for result: {result}, error: {e}")
+            return pd.DataFrame(columns=["path", "accident_time", "center_x", "center_y", "type"])
 
 class VideoInferenceVLM:
     def video_inference(self, video_path, prompt, max_new_tokens=128):
@@ -161,7 +175,7 @@ def worker_process(gpu_id, start_idx, end_idx, video_paths, prompt, output_queue
                 prompt,
                 max_new_tokens=128
             )
-            output_json = parse_in_json(output[0])
+            output_json = parse_in_json(output[0], video_path)
             output_json["video_path"] = video_path
             results.append((i, output_json))
             print(f"gpu {gpu_id} - {i + 1}/{len(video_paths)} is done.", flush=True)
@@ -215,7 +229,7 @@ here is the JSON format:
 ---
 example:
 {
-    "time": "mm.ss",
+    "time": "second.milisecond", # do not return time in hh:mm:ss format, for example, if the collision occurs at 1 second and 500 milliseconds, please return 1.5
     "coordinate": [
         [x1, y1],
         [x2, y2]
@@ -231,7 +245,7 @@ example:
     with open(test_path_file, "r", encoding="utf-8") as f:
         video_paths = [line.strip() for line in f if line.strip()]
 
-    total_videos = len(video_paths)
+    total_videos = len(video_paths[:])
     mid = total_videos // 2
 
     output_queue = mp.Queue()
@@ -258,32 +272,7 @@ example:
     total_end_time = time.time()
     total_elapsed_seconds = total_end_time - total_start_time
 
-    errors = [x for x in worker_outputs if x["error"] is not None]
-    if len(errors) > 0:
-        raise RuntimeError(str(errors))
-
-    merged_results = []
-    for worker_output in worker_outputs:
-        merged_results.extend(worker_output["results"])
-
-    merged_results.sort(key=lambda x: x[0])
-    final_results = [result for _, result in merged_results]
-
-    submission = make_submission(final_results)
-
-    description_lines = [
-        f"total_videos: {total_videos}",
-        f"total_elapsed_seconds: {total_elapsed_seconds:.4f}"
-    ]
-
-    for worker_output in sorted(worker_outputs, key=lambda x: x["gpu_id"]):
-        description_lines.append(
-            f"gpu{worker_output['gpu_id']}_elapsed_seconds: {worker_output['elapsed_seconds']:.4f}"
-        )
-
-    description_text = "\n".join(description_lines) + "\n"
-
-    save_submission(submission, "qwen3_vl_experiment_2gpu", description_text)
+    print(f"Total elapsed time: {total_elapsed_seconds:.2f} seconds")
 
 
 if __name__ == "__main__":

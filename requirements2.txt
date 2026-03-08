@@ -1,0 +1,27 @@
+# PyTorch (CUDA 12.1)
+torch==2.10.0+cu128
+torchvision
+torchaudio
+
+# HuggingFace and LLM libraries
+transformers==5.2.0
+peft>=0.7.0
+bitsandbytes>=0.41.0
+huggingface_hub==1.6.0
+accelerate>=0.25.0
+
+# Data and ML utilities
+numpy==2.4.2
+pandas==3.0.1
+opencv-python>=4.8.0
+tqdm>=4.66.0
+matplotlib==3.10.8
+
+# Monitoring and environment
+tensorboard>=2.14.0
+tensorboardX>=2.6.0
+python-dotenv==1.2.2
+
+# Optional: for better performance
+scipy
+scikit-learn

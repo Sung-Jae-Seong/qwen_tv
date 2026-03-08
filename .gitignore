@@ -2,3 +2,8 @@
 dataset/
 result/
 memo
+*.md
+__pycache__/
+output/
+*.log
+memo.txt
