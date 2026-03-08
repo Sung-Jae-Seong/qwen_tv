@@ -79,21 +79,27 @@ def load_video_frames(video_path, target_fps=5.0):
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_source_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    step = max(int(round(src_fps / target_fps)), 1)
+    step = max(int(src_fps / target_fps), 1)
 
     frames = []
     sampled_indices = []
     idx = 0
 
     while True:
-        ret, frame = cap.read()
+        if not cap.grab():
+            break
+
+        if idx % step != 0:
+            idx += 1
+            continue
+
+        ret, frame = cap.retrieve()
         if not ret:
             break
 
-        if idx % step == 0:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(Image.fromarray(frame))
-            sampled_indices.append(idx)
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(Image.fromarray(frame))
+        sampled_indices.append(idx)
         idx += 1
 
     cap.release()
@@ -225,8 +231,16 @@ class Qwen3VLInference(VideoInferenceVLM):
         return video_frames, metadata
 
 
-    def video_inference(self, video_path, prompt, max_new_tokens=128):
-        video_frames, metadata = load_video_frames(video_path, target_fps=5.0)
+    def video_inference(
+        self,
+        video_path,
+        prompt,
+        max_new_tokens=128,
+        video_frames=None,
+        metadata=None,
+    ):
+        if video_frames is None or metadata is None:
+            video_frames, metadata = load_video_frames(video_path, target_fps=5.0)
 
         sampling_params = SamplingParams(
             temperature=0.0,
@@ -269,7 +283,7 @@ def build_prompt(fps, width, height):
 def main():
     total_start_time = time.time()
     test_path_file = "dataset/test_video_path.txt"
-    max_videos = 1
+    max_videos = 10
 
     with open(test_path_file, "r", encoding="utf-8") as f:
         video_paths = [line.strip() for line in f if line.strip()]
@@ -282,14 +296,16 @@ def main():
     all_results = []
 
     for i, video_path in enumerate(video_paths):
-        fps, width, height, _ = read_video_metadata(video_path)
-        prompt = build_prompt(fps, width, height)
+        video_frames, metadata = load_video_frames(video_path, target_fps=5.0)
+        prompt = build_prompt(metadata["src_fps"], metadata["width"], metadata["height"])
 
         start_time = time.time()
         output = inference.video_inference(
             video_path=video_path,
             prompt=prompt,
-            max_new_tokens=512
+            max_new_tokens=512,
+            video_frames=video_frames,
+            metadata=metadata,
         )
         elapsed = time.time() - start_time
 
