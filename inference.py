@@ -159,6 +159,7 @@ def worker_process(gpu_id, start_idx, end_idx, video_paths, prompt, output_queue
 
 
 def main():
+    total_start_time = time.time()
     mp.set_start_method("spawn", force=True)
 
     instruction = """
@@ -249,8 +250,6 @@ example:
         target=worker_process,
         args=(1, mid, total_videos, video_paths, prompt, output_queue)
     )
-
-    total_start_time = time.time()
 
     process_0.start()
     process_1.start()

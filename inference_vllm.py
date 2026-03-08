@@ -1,4 +1,8 @@
 import os
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1")
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+
 import re
 import ast
 import json
@@ -6,53 +10,38 @@ import time
 import cv2
 from PIL import Image
 from dotenv import load_dotenv
-
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1")
-os.environ.setdefault("OMP_NUM_THREADS", "2")
-
 from huggingface_hub import login
 from transformers import AutoProcessor
 from vllm import LLM, SamplingParams
-
+import resources.prompt as prompt_module
 
 load_dotenv()
 hf_token = os.getenv("HF_TOKEN")
 if hf_token:
     login(token=hf_token)
 
+def default_result():
+    return {
+        "time": 0.0,
+        "coordinate": [[0, 0], [0, 0]],
+        "type": "head-on",
+        "reasoning": "invalid response format",
+        "collision_frame": 0,
+        "result_frame": 0,
+    }
 
 def parse_in_json(llm_response, video_path):
     text = llm_response.strip()
-
+    if not text.endswith("}"):
+        if not text.endswith('"'):
+            text += '"'
+        text += "}"
     try:
-        temp = json.loads(text)
+        temp = ast.literal_eval(text)
     except Exception:
-        try:
-            repaired = text
-            if not repaired.endswith("}"):
-                if not repaired.endswith('"'):
-                    repaired += '"'
-                repaired += "}"
-            temp = ast.literal_eval(repaired)
-        except Exception:
-            temp = {
-                "time": 0.0,
-                "coordinate": [[0, 0], [0, 0]],
-                "type": "head-on",
-                "reasoning": "invalid response format",
-                "collision_frame": 0,
-                "result_frame": 0
-            }
-
+        temp = default_result()
     if not isinstance(temp, dict):
-        temp = {
-            "time": 0.0,
-            "coordinate": [[0, 0], [0, 0]],
-            "type": "head-on",
-            "reasoning": "invalid response format",
-            "collision_frame": 0,
-            "result_frame": 0
-        }
+        temp = default_result()
 
     save_dir = os.path.join("result", "parsed_json")
     os.makedirs(save_dir, exist_ok=True)
@@ -196,6 +185,46 @@ class Qwen3VLInference(VideoInferenceVLM):
             trimmed_metadata["sampled_indices"] = metadata["sampled_indices"][:keep_count]
         return trimmed_frames, trimmed_metadata
 
+
+    def _handling_cache_overflow(self, error, video_path, video_frames, metadata):
+        error_text = str(error)
+
+        if "exceeds the pre-allocated encoder cache size" not in error_text:
+            raise error
+
+        match = re.search(
+            r"video item with length (\d+), which exceeds .* size (\d+)",
+            error_text,
+        )
+        if not match:
+            raise error
+
+        current_length = int(match.group(1))
+        cache_limit = int(match.group(2))
+        current_frame_count = len(video_frames)
+
+        if current_frame_count <= 1:
+            raise error
+
+        keep_count = int(current_frame_count * cache_limit / current_length) - 1
+        keep_count = max(1, min(keep_count, current_frame_count - 1))
+
+        print(
+            f"[trim] {os.path.basename(video_path)}: cache overflow "
+            f"({current_length} > {cache_limit}), trimming frames "
+            f"{current_frame_count} -> {keep_count}",
+            flush=True,
+        )
+
+        video_frames, metadata = self._trim_video_to_frame_count(
+            video_frames,
+            metadata,
+            keep_count,
+        )
+
+        return video_frames, metadata
+
+
     def video_inference(self, video_path, prompt, max_new_tokens=128):
         video_frames, metadata = load_video_frames(video_path, target_fps=5.0)
 
@@ -215,105 +244,17 @@ class Qwen3VLInference(VideoInferenceVLM):
                 return [outputs[0].outputs[0].text]
 
             except ValueError as e:
-                error_text = str(e)
-                if "exceeds the pre-allocated encoder cache size" not in error_text:
-                    raise
-
-                match = re.search(r"video item with length (\d+), which exceeds .* size (\d+)", error_text)
-                if not match:
-                    raise
-
-                current_length = int(match.group(1))
-                cache_limit = int(match.group(2))
-                current_frame_count = len(video_frames)
-
-                if current_frame_count <= 1:
-                    raise
-
-                keep_count = int(current_frame_count * cache_limit / current_length) - 1
-                keep_count = max(1, min(keep_count, current_frame_count - 1))
-
-                print(
-                    f"[trim] {os.path.basename(video_path)}: cache overflow "
-                    f"({current_length} > {cache_limit}), trimming frames "
-                    f"{current_frame_count} -> {keep_count}",
-                    flush=True,
-                )
-
-                video_frames, metadata = self._trim_video_to_frame_count(
+                video_frames, metadata = self._handling_cache_overflow(
+                    e,
+                    video_path,
                     video_frames,
                     metadata,
-                    keep_count,
                 )
 
 
 def build_prompt(fps, width, height):
-    instruction = """
-This video is a CCTV-view traffic accident video.
-The accident region is a really local area in the whole video so you have to analyze the corners and edges of the video carefully.
-Follow the instructions below to analyze the traffic accident video and extract the accident frame (time), accident region, and accident type.
-
-1. Analysis
-You should watch the video end to end.
-Analyze this video from behinning to end frame by frame and gather information about the traffic accident.
-Focus mainly on the road and vehicle movements. Since the video may include low resolution, occlusion, low-light conditions, and similar challenges, analyze it carefully step by step.
-Collision includes both collisions between different vehicles and collisions where a single vehicle hits a stationary object.
-Tracking the movement of vehicles helps to find the collision moment.
-
-2. Reasoning
-Return briefly why did you decide like that.
-It might be hard to detect the collision, so you might think there is no collision in the video but there must be a accident(collision) in the video.
-
-3. Temporal Prediction
-The video is represented as indexed frames in chronological order.
-Find the indexed frame where physical contact between vehicles begins or single and the result of the accident after collisions.
-Return that two frame index (collision_frame and result_frame).
-Then return the corresponding time for that indexed collision_frame.
-
-4. Spatial Prediction
-Also return one collision bounding box on that indexed collision_frame using left-top and right-bottom coordinates.
-The bbox area include one or two vehicles with collisions directly occurring
-The bounding box should enclose the collision region or the involved vehicles at the first contact moment.
-If one of the collided vehicles is occluded by other structures, predict the region to include the occluded vehicle as well.
-The bounding box must contain at least one vehicle.
-
-5. Type Prediction
-Then return the collision type. The collision type includes: head-on, rear-end, sideswipe, single, and t-bone collisions.
-Head-on is defined as a collision where the front ends of two vehicles hit each other.
-Rear-end is defined as a collision where the front end of one vehicle hits the rear end of another vehicle.
-Sideswipe is defined as a slight collision where the sides of two vehicles hit each other.
-Single is defined as an accident that involves only one vehicle, such as a vehicle hitting a stationary object or a vehicle losing control and crashing without colliding with another vehicle.
-T-bone is defined as a collision where the front end of one vehicle hits the side of another vehicle, forming a 'T' shape.
-"""
-
-    return_format = """
-Please return the result in JSON format only, not markdown.
-Here is the JSON format:
-{
-    "reasoning": "explain the situation of the video after accident occurs and why did you decide like that",
-    "collision_frame": exact indexed frame where the collision occurs,
-    "result_frame": exact indexed frame after the collision occurs,
-    "time": exact time corresponding to that indexed frame,
-    "coordinate": [
-        [x1, y1],
-        [x2, y2]
-    ],
-    "type": "choose one from [head-on, rear-end, sideswipe, single, t-bone]"
-}
-
-Example:
-{
-    "reasoning": "After carefully analyzing the video frame by frame, I observed that at frame 150, the front end of a red car made contact with the rear end of a blue car, which indicates a rear-end collision. The bounding box coordinates [100, 200], [300, 400] enclose the area where the two vehicles are in contact. The collision type is classified as rear-end because the red car hit the back of the blue car. After the collision, at frame 180, both vehicles came to a stop, which confirms that the accident occurred.",
-    "collision_frame": 150,
-    "result_frame": 180,
-    "time": "5.00",
-    "coordinate": [
-        [100, 200],
-        [300, 400]
-    ],
-    "type": "rear-end"
-}
-"""
+    instruction = prompt_module.instruction
+    return_format = prompt_module.return_format
 
     video_info = (
         f"The original video has a frame rate of {fps:.2f} frames per second. "
@@ -326,18 +267,18 @@ Example:
 
 
 def main():
+    total_start_time = time.time()
     test_path_file = "dataset/test_video_path.txt"
-    max_videos = 100
+    max_videos = 1
 
     with open(test_path_file, "r", encoding="utf-8") as f:
         video_paths = [line.strip() for line in f if line.strip()]
 
-    video_paths = video_paths[60:max_videos]
+    video_paths = video_paths[:max_videos]
 
     os.makedirs("result", exist_ok=True)
     inference = Qwen3VLInference()
 
-    total_start_time = time.time()
     all_results = []
 
     for i, video_path in enumerate(video_paths):
