@@ -8,17 +8,62 @@ import ast
 import json
 import time
 import cv2
-from PIL import Image
+import multiprocessing as mp
 from dotenv import load_dotenv
 from huggingface_hub import login
 from transformers import AutoProcessor
-from vllm import LLM, SamplingParams
 import resources.prompt as prompt_module
 
 load_dotenv()
 hf_token = os.getenv("HF_TOKEN")
 if hf_token:
     login(token=hf_token)
+
+def worker_process(gpu_id, start_idx, end_idx, video_paths, output_queue):
+    try:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        os.environ["OMP_NUM_THREADS"] = "2"
+
+        inference = Qwen3VLInference(tensor_parallel_size=1)
+        results = []
+
+        for i in range(start_idx, end_idx):
+            video_path = video_paths[i]
+            video_frames, metadata = load_video_frames(video_path, target_fps=5.0)
+            prompt = build_prompt(metadata["src_fps"], metadata["width"], metadata["height"])
+
+            start_time = time.time()
+            output = inference.video_inference(
+                video_path=video_path,
+                prompt=prompt,
+                max_new_tokens=512,
+                video_frames=video_frames,
+                metadata=metadata,
+            )
+            elapsed = time.time() - start_time
+
+            parsed = parse_in_json(output[0], video_path)
+            parsed["video_path"] = video_path
+            parsed["inference_seconds"] = round(elapsed, 2)
+            results.append((i, parsed))
+
+            print(
+                f"gpu {gpu_id} - {i + 1}/{len(video_paths)} done - {video_path} - {elapsed:.2f} sec",
+                flush=True,
+            )
+
+        output_queue.put({
+            "gpu_id": gpu_id,
+            "results": results,
+            "error": None,
+        })
+
+    except Exception as e:
+        output_queue.put({
+            "gpu_id": gpu_id,
+            "results": [],
+            "error": repr(e),
+        })
 
 def default_result():
     return {
@@ -56,19 +101,6 @@ def parse_in_json(llm_response, video_path):
 
     return temp
 
-
-def read_video_metadata(video_path):
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0:
-        fps = 5.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap.release()
-    return fps, width, height, frame_count
-
-
 def load_video_frames(video_path, target_fps=5.0):
     cap = cv2.VideoCapture(video_path)
     src_fps = cap.get(cv2.CAP_PROP_FPS)
@@ -98,7 +130,8 @@ def load_video_frames(video_path, target_fps=5.0):
             break
 
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frames.append(Image.fromarray(frame))
+        frame = frame.astype("uint8", copy=False)
+        frames.append(frame)
         sampled_indices.append(idx)
         idx += 1
 
@@ -121,12 +154,14 @@ class VideoInferenceVLM:
 
 
 class Qwen3VLInference(VideoInferenceVLM):
-    def __init__(self, model_id="Qwen/Qwen3-VL-8B-Instruct", max_encoder_cache_size=12288):
+    def __init__(self, model_id="Qwen/Qwen3-VL-8B-Instruct", max_encoder_cache_size=12288, tensor_parallel_size=1):
+        from vllm import LLM
+        from vllm import SamplingParams
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.max_encoder_cache_size = max_encoder_cache_size
         self.llm = LLM(
             model=model_id,
-            tensor_parallel_size=2,
+            tensor_parallel_size=tensor_parallel_size,
             dtype="float16",
             max_model_len=16384,
             max_num_seqs=1,
@@ -150,11 +185,11 @@ class Qwen3VLInference(VideoInferenceVLM):
                 "role": "user",
                 "content": [
                     {
-                        "type": "video",
-                    },
-                    {
                         "type": "text",
                         "text": prompt,
+                    },
+                    {
+                        "type": "video",
                     },
                 ],
             }
@@ -190,7 +225,6 @@ class Qwen3VLInference(VideoInferenceVLM):
         if metadata.get("sampled_indices"):
             trimmed_metadata["sampled_indices"] = metadata["sampled_indices"][:keep_count]
         return trimmed_frames, trimmed_metadata
-
 
     def _handling_cache_overflow(self, error, video_path, video_frames, metadata):
         error_text = str(error)
@@ -229,7 +263,6 @@ class Qwen3VLInference(VideoInferenceVLM):
         )
 
         return video_frames, metadata
-
 
     def video_inference(
         self,
@@ -277,51 +310,60 @@ def build_prompt(fps, width, height):
         f"Use this information to calculate the exact time and predict accurate bounding box coordinates."
     )
 
-    return instruction + "\n" + video_info + "\n" + return_format
+    return instruction + "\n" + return_format + "\n" + video_info
 
 
 def main():
+    mp.set_start_method("spawn", force=True)
+
     total_start_time = time.time()
     test_path_file = "dataset/test_video_path.txt"
-    max_videos = 10
+    max_videos = 100
 
     with open(test_path_file, "r", encoding="utf-8") as f:
         video_paths = [line.strip() for line in f if line.strip()]
 
     video_paths = video_paths[:max_videos]
+    total_videos = len(video_paths)
+    mid = total_videos // 2
 
     os.makedirs("result", exist_ok=True)
-    inference = Qwen3VLInference()
 
-    all_results = []
+    output_queue = mp.Queue()
 
-    for i, video_path in enumerate(video_paths):
-        video_frames, metadata = load_video_frames(video_path, target_fps=5.0)
-        prompt = build_prompt(metadata["src_fps"], metadata["width"], metadata["height"])
+    process_0 = mp.Process(
+        target=worker_process,
+        args=(0, 0, mid, video_paths, output_queue)
+    )
+    process_1 = mp.Process(
+        target=worker_process,
+        args=(1, mid, total_videos, video_paths, output_queue)
+    )
 
-        start_time = time.time()
-        output = inference.video_inference(
-            video_path=video_path,
-            prompt=prompt,
-            max_new_tokens=512,
-            video_frames=video_frames,
-            metadata=metadata,
-        )
-        elapsed = time.time() - start_time
+    process_0.start()
+    process_1.start()
 
-        parsed = parse_in_json(output[0], video_path)
-        parsed["video_path"] = video_path
-        parsed["inference_seconds"] = round(elapsed, 2)
-        all_results.append(parsed)
+    worker_outputs = [output_queue.get(), output_queue.get()]
 
-        print(f"{i + 1}/{len(video_paths)} done - {video_path} - {elapsed:.2f} sec", flush=True)
+    process_0.join()
+    process_1.join()
 
-    total_elapsed_seconds = time.time() - total_start_time
+    indexed_results = {}
+    for worker_output in worker_outputs:
+        if worker_output["error"] is not None:
+            print(f"worker on gpu {worker_output['gpu_id']} failed: {worker_output['error']}", flush=True)
+            continue
+
+        for idx, parsed in worker_output["results"]:
+            indexed_results[idx] = parsed
+
+    all_results = [indexed_results[i] for i in sorted(indexed_results.keys())]
 
     save_path = os.path.join("result", "all_results.json")
     with open(save_path, "w", encoding="utf-8") as f:
         json.dump(all_results, f, ensure_ascii=False, indent=2)
 
+    total_elapsed_seconds = time.time() - total_start_time
     print(f"Total elapsed time: {total_elapsed_seconds:.2f} seconds", flush=True)
 
 
