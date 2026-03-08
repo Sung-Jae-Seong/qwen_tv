@@ -7,5 +7,7 @@ output.log
 __pycache__/
 *.pyc
 prev/
-qwen3_for_time.ipynb
+01_qwen3_for_time.ipynb
 build_submission_from_parsed_json.py
+02_qwen3_2stage.ipynb
+03_qwen3_vLLM.ipynb
