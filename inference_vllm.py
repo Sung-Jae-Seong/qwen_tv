@@ -1,4 +1,5 @@
 import os
+import re
 import ast
 import json
 import time
@@ -125,8 +126,9 @@ class VideoInferenceVLM:
 
 
 class Qwen3VLInference(VideoInferenceVLM):
-    def __init__(self, model_id="Qwen/Qwen3-VL-8B-Instruct"):
+    def __init__(self, model_id="Qwen/Qwen3-VL-8B-Instruct", max_encoder_cache_size=12288):
         self.processor = AutoProcessor.from_pretrained(model_id)
+        self.max_encoder_cache_size = max_encoder_cache_size
         self.llm = LLM(
             model=model_id,
             tensor_parallel_size=2,
@@ -140,8 +142,7 @@ class Qwen3VLInference(VideoInferenceVLM):
             enforce_eager=False,
         )
 
-    def video_inference(self, video_path, prompt, max_new_tokens=128):
-        video_frames, metadata = load_video_frames(video_path, target_fps=5.0)
+    def _build_llm_input(self, video_frames, metadata, prompt):
         total_num_sampled_frames = len(video_frames)
 
         if metadata["src_fps"] > 0 and metadata["total_source_frames"] > 0:
@@ -170,32 +171,80 @@ class Qwen3VLInference(VideoInferenceVLM):
             add_generation_prompt=True,
         )
 
+        return {
+            "prompt": text_prompt,
+            "multi_modal_data": {
+                "video": (
+                    video_frames,
+                    {
+                        "fps": metadata["target_fps"],
+                        "total_num_frames": metadata["total_source_frames"] if metadata["total_source_frames"] > 0 else total_num_sampled_frames,
+                        "duration": duration,
+                        "video_backend": "opencv",
+                        "frames_indices": metadata["sampled_indices"] if metadata["sampled_indices"] else list(range(total_num_sampled_frames)),
+                        "do_sample_frames": False,
+                    },
+                ),
+            },
+        }
+
+    def _trim_video_to_frame_count(self, video_frames, metadata, keep_count):
+        keep_count = max(1, min(keep_count, len(video_frames)))
+        trimmed_frames = video_frames[:keep_count]
+        trimmed_metadata = dict(metadata)
+        if metadata.get("sampled_indices"):
+            trimmed_metadata["sampled_indices"] = metadata["sampled_indices"][:keep_count]
+        return trimmed_frames, trimmed_metadata
+
+    def video_inference(self, video_path, prompt, max_new_tokens=128):
+        video_frames, metadata = load_video_frames(video_path, target_fps=5.0)
+
         sampling_params = SamplingParams(
             temperature=0.0,
             max_tokens=max_new_tokens,
         )
 
-        outputs = self.llm.generate(
-            {
-                "prompt": text_prompt,
-                "multi_modal_data": {
-                    "video": (
-                        video_frames,
-                        {
-                            "fps": metadata["target_fps"],
-                            "total_num_frames": metadata["total_source_frames"] if metadata["total_source_frames"] > 0 else total_num_sampled_frames,
-                            "duration": duration,
-                            "video_backend": "opencv",
-                            "frames_indices": metadata["sampled_indices"] if metadata["sampled_indices"] else list(range(total_num_sampled_frames)),
-                            "do_sample_frames": False,
-                        },
-                    ),
-                },
-            },
-            sampling_params=sampling_params,
-        )
+        while True:
+            try:
+                llm_input = self._build_llm_input(video_frames, metadata, prompt)
+                outputs = self.llm.generate(
+                    llm_input,
+                    sampling_params=sampling_params,
+                    use_tqdm=False,
+                )
+                return [outputs[0].outputs[0].text]
 
-        return [outputs[0].outputs[0].text]
+            except ValueError as e:
+                error_text = str(e)
+                if "exceeds the pre-allocated encoder cache size" not in error_text:
+                    raise
+
+                match = re.search(r"video item with length (\d+), which exceeds .* size (\d+)", error_text)
+                if not match:
+                    raise
+
+                current_length = int(match.group(1))
+                cache_limit = int(match.group(2))
+                current_frame_count = len(video_frames)
+
+                if current_frame_count <= 1:
+                    raise
+
+                keep_count = int(current_frame_count * cache_limit / current_length) - 1
+                keep_count = max(1, min(keep_count, current_frame_count - 1))
+
+                print(
+                    f"[trim] {os.path.basename(video_path)}: cache overflow "
+                    f"({current_length} > {cache_limit}), trimming frames "
+                    f"{current_frame_count} -> {keep_count}",
+                    flush=True,
+                )
+
+                video_frames, metadata = self._trim_video_to_frame_count(
+                    video_frames,
+                    metadata,
+                    keep_count,
+                )
 
 
 def build_prompt(fps, width, height):
@@ -283,7 +332,7 @@ def main():
     with open(test_path_file, "r", encoding="utf-8") as f:
         video_paths = [line.strip() for line in f if line.strip()]
 
-    video_paths = video_paths[:max_videos]
+    video_paths = video_paths[60:max_videos]
 
     os.makedirs("result", exist_ok=True)
     inference = Qwen3VLInference()

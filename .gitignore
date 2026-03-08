@@ -1,13 +1,9 @@
 .env
 dataset/
 result/
-memo
 data_analysis/
 output.log
 __pycache__/
 *.pyc
 prev/
-01_qwen3_for_time.ipynb
-build_submission_from_parsed_json.py
-02_qwen3_2stage.ipynb
-03_qwen3_vLLM.ipynb
+dev/
