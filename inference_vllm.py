@@ -19,6 +19,8 @@ hf_token = os.getenv("HF_TOKEN")
 if hf_token:
     login(token=hf_token)
 
+TARGET_FPS = 5.0
+
 def worker_process(gpu_id, start_idx, end_idx, video_paths, output_queue):
     try:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -29,7 +31,7 @@ def worker_process(gpu_id, start_idx, end_idx, video_paths, output_queue):
 
         for i in range(start_idx, end_idx):
             video_path = video_paths[i]
-            video_frames, metadata = load_video_frames(video_path, target_fps=5.0)
+            video_frames, metadata = load_video_frames(video_path, target_fps=TARGET_FPS)
             prompt = build_prompt(metadata["src_fps"], metadata["width"], metadata["height"])
 
             start_time = time.time()
@@ -65,14 +67,18 @@ def worker_process(gpu_id, start_idx, end_idx, video_paths, output_queue):
             "error": repr(e),
         })
 
-def default_result():
+def default_result(center_time, center_x, center_y):
+    # return {
+    #     "time": center_time,
+    #     "coordinate": [[center_x, center_y], [center_x, center_y]],
+    #     "type": "rear-end",
+    #     "reasoning": "invalid response format",
+    # }
     return {
         "time": 0.0,
         "coordinate": [[0, 0], [0, 0]],
         "type": "head-on",
         "reasoning": "invalid response format",
-        "collision_frame": 0,
-        "result_frame": 0,
     }
 
 def parse_in_json(llm_response, video_path):
@@ -81,12 +87,25 @@ def parse_in_json(llm_response, video_path):
         if not text.endswith('"'):
             text += '"'
         text += "}"
+    center_time = f"{(cv2.VideoCapture(video_path).get(cv2.CAP_PROP_FRAME_COUNT) / cv2.VideoCapture(video_path).get(cv2.CAP_PROP_FPS) / 2):.2f}"
+    center_x = int(cv2.VideoCapture(video_path).get(cv2.CAP_PROP_FRAME_WIDTH) / 2)
+    center_y = int(cv2.VideoCapture(video_path).get(cv2.CAP_PROP_FRAME_HEIGHT) / 2)
     try:
         temp = ast.literal_eval(text)
     except Exception:
-        temp = default_result()
+        temp = default_result(center_time, center_x, center_y)
     if not isinstance(temp, dict):
-        temp = default_result()
+        temp = default_result(center_time, center_x, center_y)
+    # 만약 dicrionary에 collision_frame이 있다면 time을 계산해서 넣어주기
+    if "collision_frame" in temp:
+        try:
+            collision_frame = temp["collision_frame"]
+            fps = round(cv2.VideoCapture(video_path).get(cv2.CAP_PROP_FPS))
+            center_time = collision_frame
+            temp["time"] = f"{center_time:.2f}" / TARGET_FPS
+        except Exception:
+            # time을 전체 비디오의 중앙 값으로 넣어주기
+            temp["time"] = f"{(cv2.VideoCapture(video_path).get(cv2.CAP_PROP_FRAME_COUNT) / fps / 2):.2f}"
 
     save_dir = os.path.join("result", "parsed_json")
     os.makedirs(save_dir, exist_ok=True)
@@ -101,7 +120,7 @@ def parse_in_json(llm_response, video_path):
 
     return temp
 
-def load_video_frames(video_path, target_fps=5.0):
+def load_video_frames(video_path, target_fps=TARGET_FPS):
     cap = cv2.VideoCapture(video_path)
     src_fps = cap.get(cv2.CAP_PROP_FPS)
     if src_fps <= 0:
@@ -157,6 +176,7 @@ class Qwen3VLInference(VideoInferenceVLM):
     def __init__(self, model_id="Qwen/Qwen3-VL-8B-Instruct", max_encoder_cache_size=12288, tensor_parallel_size=1):
         from vllm import LLM
         from vllm import SamplingParams
+        self.SamplingParams = SamplingParams
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.max_encoder_cache_size = max_encoder_cache_size
         self.llm = LLM(
@@ -273,9 +293,9 @@ class Qwen3VLInference(VideoInferenceVLM):
         metadata=None,
     ):
         if video_frames is None or metadata is None:
-            video_frames, metadata = load_video_frames(video_path, target_fps=5.0)
+            video_frames, metadata = load_video_frames(video_path, target_fps=TARGET_FPS)
 
-        sampling_params = SamplingParams(
+        sampling_params = self.SamplingParams(
             temperature=0.0,
             max_tokens=max_new_tokens,
         )
@@ -318,12 +338,12 @@ def main():
 
     total_start_time = time.time()
     test_path_file = "dataset/test_video_path.txt"
-    max_videos = 100
+    max_videos = 20
 
     with open(test_path_file, "r", encoding="utf-8") as f:
         video_paths = [line.strip() for line in f if line.strip()]
 
-    video_paths = video_paths[:max_videos]
+    # video_paths = video_paths[:max_videos]
     total_videos = len(video_paths)
     mid = total_videos // 2
 

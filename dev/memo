@@ -1,0 +1,3 @@
+# stop iteration 오류 시
+pip install transformers==5.2.0
+

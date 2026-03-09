@@ -6,4 +6,4 @@ output.log
 __pycache__/
 *.pyc
 prev/
-dev/
+dev_temp/
