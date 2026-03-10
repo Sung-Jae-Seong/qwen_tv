@@ -122,7 +122,7 @@ def create_sft_sample(
         "please return the result in JSON format only, not markdown.\n"
         "here is the JSON format:\n"
         "{\n"
-        '    "time": exact time in seconds, the temporal location of the video where collision occured,\n'
+        '    "time": exact time, the temporal location of the video where collision occured,\n'
         '    "coordinate": left-top and right-bottom, the position of bounding box on the video frame that contains the collision,\n'
         '    "type": choose and return one of the following [head-on, rear-end, sideswipe, single, t-bone],\n'
         '    "why": explain why did you return that time, coordinate and type.\n'
@@ -130,7 +130,7 @@ def create_sft_sample(
         "---\n"
         "example:\n"
         "{\n"
-        '    "time": seconds,\n'
+        '    "time": "second.milisecond", # do not return time in hh:mm:ss format, for example, if the collision occurs at 1 second and 500 milliseconds, please return 1.5,\n'
         '    "coordinate": [\n'
         "        [x1, y1],\n"
         "        [x2, y2]\n"

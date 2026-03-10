@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from huggingface_hub import login
 from transformers import AutoProcessor, AutoModelForImageTextToText
 from safetensors.torch import load_file
+import argparse
 
 load_dotenv()
 hf_token = os.getenv("HF_TOKEN")
@@ -177,7 +178,7 @@ class Qwen3VLLoRAInference(VideoInferenceVLM):
             try:
                 self.model = AutoModelForImageTextToText.from_pretrained(
                     model_id,
-                    dtype=torch.float16,
+                    torch_dtype=torch.bfloat16, # Match standard LoRA training precision
                     device_map="auto",
                     max_memory=max_memory,
                     trust_remote_code=True
@@ -309,6 +310,10 @@ class Qwen3VLLoRAInference(VideoInferenceVLM):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Qwen-VL LoRA Inference")
+    parser.add_argument("--lora_model_path", type=str, default="/workspace/minseok/qwen_tv/output/final_lora_model/final_lora_model", help="Path to the LoRA adapter directory")
+    args = parser.parse_args()
+
     mp.set_start_method("spawn", force=True)
 
     instruction = (
@@ -327,7 +332,7 @@ def main():
 please return the result in JSON format only, not markdown.
 here is the JSON format:
 {
-    "time": exact time in seconds, the temporal location of the video where collision occured,
+    "time": exact time, the temporal location of the video where collision occured,
     "coordinate": left-top and right-bottom, the position of bounding box on the video frame that contains the collision,
     "type": choose and return one of the following [head-on, rear-end, sideswipe, single, t-bone],
     "why": explain why did you return that time, coordinate and type.
@@ -335,7 +340,7 @@ here is the JSON format:
 ---
 example:
 {
-    "time": seconds,
+    "time": "second.milisecond", # do not return time in hh:mm:ss format, for example, if the collision occurs at 1 second and 500 milliseconds, please return 1.5
     "coordinate": [
         [x1, y1],
         [x2, y2]
@@ -347,7 +352,7 @@ example:
 
     test_path_file = "dataset/test_video_path.txt"
     # 절대 경로로 지정된 LoRA 모델 경로 적용
-    lora_model_path = "/workspace/minseok/qwen_tv/output/final_lora_model/final_lora_model"
+    lora_model_path = args.lora_model_path
     prompt = instruction + return_format
 
     with open(test_path_file, "r", encoding="utf-8") as f:

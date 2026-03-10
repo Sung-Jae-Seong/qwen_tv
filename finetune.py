@@ -68,6 +68,10 @@ class ModelArguments:
         default=True,
         metadata={"help": "Use LoRA for fine-tuning"}
     )
+    use_qlora: bool = field(
+        default=True,
+        metadata={"help": "Use QLoRA (4-bit quantization)"}
+    )
     lora_r: int = field(
         default=64,
         metadata={"help": "LoRA rank"}
@@ -81,7 +85,7 @@ class ModelArguments:
         metadata={"help": "LoRA dropout"}
     )
     lora_target_modules: List[str] = field(
-        default_factory=lambda: ["q_proj", "v_proj"],
+        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         metadata={"help": "Target modules for LoRA"}
     )
 
@@ -167,22 +171,13 @@ class VideoSFTDataset(torch.utils.data.Dataset):
         
         # Process with Qwen processor
         try:
-            # Extract text from messages
-            user_text = ""
-            assistant_text = ""
-            for msg in messages:
-                if msg['role'] == 'user':
-                    content = msg['content']
-                    if isinstance(content, list):
-                        user_text = next((item['text'] for item in content if isinstance(item, dict) and item.get('type') == 'text'), "")
-                    else:
-                        user_text = content
-                elif msg['role'] == 'assistant':
-                    assistant_text = msg['content']
+            # Create a string containing the chat format prompt without formatting prompt
+            # The apply_chat_template will convert the message array into proper formatting
+            text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
             
             # Create input combining text and video
             inputs = self.processor(
-                text=user_text,
+                text=[text],
                 images=None,
                 videos=[frames],
                 return_tensors="pt",
@@ -198,6 +193,25 @@ class VideoSFTDataset(torch.utils.data.Dataset):
             # Labels: -100 for padding, actual token ids elsewhere
             labels = input_ids.clone()
             labels[attention_mask == 0] = -100
+            
+            # Mask user prompt in labels (so model only learns to predict assistant's response)
+            prompt_messages = [m for m in messages if m['role'] != 'assistant']
+            prompt_text = self.processor.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True)
+            prompt_inputs = self.processor(
+                text=[prompt_text],
+                images=None,
+                videos=[frames],
+                return_tensors="pt",
+                padding=False,
+                truncation=True,
+                max_length=self.max_seq_length,
+            )
+            # Find the size of the prompt without padding
+            prompt_ids = prompt_inputs['input_ids'].squeeze(0)
+            prompt_length = len(prompt_ids)
+            if prompt_length > 0:
+                # Mask the prompt so we only train on assistant output
+                labels[:prompt_length] = -100
             
             result = {
                 'input_ids': input_ids,
@@ -236,21 +250,30 @@ class VideoSFTDataset(torch.utils.data.Dataset):
 def setup_model_and_processor(model_args: ModelArguments):
     """Setup model with LoRA and processor."""
     
-    # BitsAndBytes config for 4-bit quantization
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    )
-    
-    # Load model with quantization
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_args.model_name_or_path,
-        quantization_config=bnb_config,
-        device_map="auto",
-        trust_remote_code=True,
-    )
+    if model_args.use_qlora:
+        # BitsAndBytes config for 4-bit quantization
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+        
+        # Load model with QLoRA quantization
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_args.model_name_or_path,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+    else:
+        # Load model with bfloat16 for standard LoRA
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_args.model_name_or_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
     
     # Setup LoRA
     if model_args.use_lora:
@@ -326,13 +349,22 @@ class DataCollatorForVideoSFT:
             'labels': torch.stack(labels_list),
         }
         
-        # Add video tensors
+        # Add video tensors with padding if necessary
         for key, values in video_tensors.items():
             if len(values) == len(batch):
                 try:
-                    result[key] = torch.stack(values)
-                except (RuntimeError, ValueError):
-                    # Skip if stacking fails
+                    if key in ['pixel_values', 'image_embeds', 'video_embeds']:
+                        # These might have different shapes, need to pad or concatenate properly
+                        result[key] = torch.cat(values, dim=0) if values[0].dim() > 0 else torch.stack(values)
+                    elif key in ['image_grid_thw', 'video_grid_thw']:
+                        # Ensure 2D shape (num_items, 3) for THW
+                        # If a single item is (3,), it should become (1, 3) before concat/stack
+                        values_2d = [v.unsqueeze(0) if v.dim() == 1 else v for v in values]
+                        result[key] = torch.cat(values_2d, dim=0)
+                    else:
+                        result[key] = torch.stack(values)
+                except (RuntimeError, ValueError) as e:
+                    print(f"Warning: Could not batch {key}: {e}")
                     pass
         
         return result
@@ -363,6 +395,7 @@ def main():
     parser.add_argument("--max_steps", type=int, default=-1)
     parser.add_argument("--bf16", type=bool, default=True)
     parser.add_argument("--use_lora", type=bool, default=True)
+    parser.add_argument("--use_qlora", type=bool, default=True)
     parser.add_argument("--lora_r", type=int, default=64)
     parser.add_argument("--lora_alpha", type=int, default=16)
     
@@ -372,6 +405,7 @@ def main():
     model_args = ModelArguments(
         model_name_or_path=args.model_name_or_path,
         use_lora=args.use_lora,
+        use_qlora=args.use_qlora,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
     )
