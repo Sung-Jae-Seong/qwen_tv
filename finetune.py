@@ -5,32 +5,34 @@ This script uses QLoRA (4-bit quantization) to fine-tune Qwen3-VL-8B
 on the CCTV accident detection dataset.
 """
 
-import os
-import json
 import argparse
-from pathlib import Path
+import json
+import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
 
-import torch
 import cv2
 import numpy as np
-import pandas as pd
-from tqdm import tqdm
-
-from transformers import (
-    AutoProcessor,
-    AutoModelForImageTextToText,
-    Trainer,
-    TrainingArguments,
-    BitsAndBytesConfig,
-)
-from peft import LoraConfig, get_peft_model
-
+import torch
 from dotenv import load_dotenv
 from huggingface_hub import login
+from peft import LoraConfig, get_peft_model
+from transformers import (
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    BitsAndBytesConfig,
+    Trainer,
+    TrainingArguments,
+)
 
-load_dotenv()
+REPO_ROOT = Path(__file__).resolve().parent
+DATASET_ROOT = REPO_ROOT / "dataset" / "sim_dataset"
+DEFAULT_TRAIN_FILE = DATASET_ROOT / "train_sft.jsonl"
+DEFAULT_VAL_FILE = DATASET_ROOT / "val_sft.jsonl"
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "output" / "qwen3_vl_lora"
+
+load_dotenv(REPO_ROOT / ".env")
 hf_token = os.getenv("HF_TOKEN")
 if hf_token:
     login(token=hf_token)
@@ -52,63 +54,126 @@ def str2bool(value):
     )
 
 
+def iter_candidate_paths(path_value: str, extra_bases: Optional[Iterable[Path]] = None):
+    path = Path(path_value).expanduser()
+    if path.is_absolute():
+        yield path
+        return
+
+    seen = set()
+    bases = [Path.cwd(), REPO_ROOT]
+    if extra_bases:
+        bases.extend(Path(base) for base in extra_bases)
+
+    for base in bases:
+        candidate = (base / path).resolve()
+        candidate_key = str(candidate)
+        if candidate_key not in seen:
+            seen.add(candidate_key)
+            yield candidate
+
+
+def find_existing_path(path_value: str, extra_bases: Optional[Iterable[Path]] = None) -> Optional[Path]:
+    for candidate in iter_candidate_paths(path_value, extra_bases=extra_bases):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def resolve_existing_path(path_value: str, extra_bases: Optional[Iterable[Path]] = None) -> Path:
+    resolved = find_existing_path(path_value, extra_bases=extra_bases)
+    if resolved is not None:
+        return resolved
+
+    searched = ", ".join(str(path) for path in iter_candidate_paths(path_value, extra_bases=extra_bases))
+    raise FileNotFoundError(f"Path not found: {path_value}. Searched: {searched}")
+
+
+def resolve_output_path(path_value: str) -> Path:
+    path = Path(path_value).expanduser()
+    if path.is_absolute():
+        return path
+    return (Path.cwd() / path).resolve()
+
+
+def maybe_resolve_path(path_value: str, extra_bases: Optional[Iterable[Path]] = None) -> str:
+    resolved = find_existing_path(path_value, extra_bases=extra_bases)
+    return str(resolved) if resolved is not None else path_value
+
+
+def get_preferred_compute_dtype() -> torch.dtype:
+    if not torch.cuda.is_available():
+        return torch.float32
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+
 @dataclass
 class DataArguments:
     """Arguments for data configuration."""
+
     train_file: str = field(
-        default="dataset/sim_dataset/train_sft.jsonl",
-        metadata={"help": "Path to training JSONL file"}
+        default=str(DEFAULT_TRAIN_FILE),
+        metadata={"help": "Path to training JSONL file"},
     )
     val_file: str = field(
-        default="dataset/sim_dataset/val_sft.jsonl",
-        metadata={"help": "Path to validation JSONL file"}
+        default=str(DEFAULT_VAL_FILE),
+        metadata={"help": "Path to validation JSONL file"},
     )
     max_seq_length: int = field(
         default=2048,
-        metadata={"help": "Maximum sequence length"}
+        metadata={"help": "Maximum sequence length"},
     )
     num_frames: int = field(
         default=8,
-        metadata={"help": "Number of frames to extract from video"}
+        metadata={"help": "Number of frames to extract from video"},
     )
 
 
 @dataclass
 class ModelArguments:
     """Arguments for model configuration."""
+
     model_name_or_path: str = field(
-        default="Qwen/Qwen3-VL-8b-Instruct",
-        metadata={"help": "Model name or path"}
+        default="Qwen/Qwen3-VL-8B-Instruct",
+        metadata={"help": "Model name or path"},
     )
     use_lora: bool = field(
         default=True,
-        metadata={"help": "Use LoRA for fine-tuning"}
+        metadata={"help": "Use LoRA for fine-tuning"},
     )
     use_qlora: bool = field(
         default=True,
-        metadata={"help": "Use QLoRA (4-bit quantization)"}
+        metadata={"help": "Use QLoRA (4-bit quantization)"},
     )
     lora_r: int = field(
         default=64,
-        metadata={"help": "LoRA rank"}
+        metadata={"help": "LoRA rank"},
     )
     lora_alpha: int = field(
         default=16,
-        metadata={"help": "LoRA alpha"}
+        metadata={"help": "LoRA alpha"},
     )
     lora_dropout: float = field(
         default=0.05,
-        metadata={"help": "LoRA dropout"}
+        metadata={"help": "LoRA dropout"},
     )
     lora_target_modules: List[str] = field(
-        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        metadata={"help": "Target modules for LoRA"}
+        default_factory=lambda: [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+        metadata={"help": "Target modules for LoRA"},
     )
 
 
 class VideoSFTDataset(torch.utils.data.Dataset):
     """Dataset for video SFT training."""
-    
+
     def __init__(
         self,
         jsonl_path: str,
@@ -116,39 +181,55 @@ class VideoSFTDataset(torch.utils.data.Dataset):
         num_frames: int = 8,
         max_seq_length: int = 2048,
     ):
-        self.jsonl_path = jsonl_path
+        self.jsonl_path = resolve_existing_path(jsonl_path)
         self.processor = processor
         self.num_frames = num_frames
         self.max_seq_length = max_seq_length
-        self.tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else None
-        
-        # Load JSONL
+        self.tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else None
+        self.base_dirs = [self.jsonl_path.parent]
+
         self.samples = []
-        with open(jsonl_path, 'r', encoding='utf-8') as f:
+        missing_videos = []
+        with open(self.jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
-                if line.strip():
-                    self.samples.append(json.loads(line))
-        
-        print(f"Loaded {len(self.samples)} samples from {jsonl_path}")
-    
+                if not line.strip():
+                    continue
+
+                sample = json.loads(line)
+                video_path = sample.get("video")
+                resolved_video = maybe_resolve_path(video_path, extra_bases=self.base_dirs) if video_path else None
+                sample["_resolved_video"] = resolved_video
+                self.samples.append(sample)
+
+                if resolved_video is None or not Path(resolved_video).exists():
+                    missing_videos.append(video_path)
+
+        print(f"Loaded {len(self.samples)} samples from {self.jsonl_path}")
+        if missing_videos:
+            print(
+                f"Warning: {len(missing_videos)} samples reference missing video files. "
+                "They will fall back to dummy frames."
+            )
+            preview = ", ".join(str(path) for path in missing_videos[:3])
+            print(f"Missing video examples: {preview}")
+
     def extract_frames(self, video_path: str, num_frames: int = 8) -> Optional[List[np.ndarray]]:
         """Extract frames from video."""
         try:
-            if not os.path.exists(video_path):
+            if not Path(video_path).exists():
                 return None
-                
+
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
                 return None
-            
+
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             if total_frames == 0:
                 cap.release()
                 return None
-            
-            # Select frame indices uniformly
+
             frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
-            
+
             frames = []
             for frame_idx in frame_indices:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -156,42 +237,38 @@ class VideoSFTDataset(torch.utils.data.Dataset):
                 if ret:
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     frames.append(frame)
-            
+
             cap.release()
-            
+
             if len(frames) < num_frames:
-                # Pad with last frame
                 while len(frames) < num_frames:
                     frames.append(frames[-1] if frames else np.zeros((480, 640, 3), dtype=np.uint8))
-            
+
             return frames[:num_frames]
-        
+
         except Exception:
             return None
-    
+
     def __len__(self):
         return len(self.samples)
-    
+
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        
-        video_path = sample['video']
-        messages = sample['messages']
-        
-        # Extract frames
+
+        video_path = sample.get("_resolved_video") or sample["video"]
+        messages = sample["messages"]
+
         frames = self.extract_frames(video_path, self.num_frames)
-        
-        # Fallback to dummy frames if video can't be loaded
         if frames is None or len(frames) == 0:
             frames = [np.zeros((480, 640, 3), dtype=np.uint8) for _ in range(self.num_frames)]
-        
-        # Process with Qwen processor
+
         try:
-            # Create a string containing the chat format prompt without formatting prompt
-            # The apply_chat_template will convert the message array into proper formatting
-            text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-            
-            # Create input combining text and video
+            text = self.processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+
             inputs = self.processor(
                 text=[text],
                 images=None,
@@ -201,18 +278,23 @@ class VideoSFTDataset(torch.utils.data.Dataset):
                 truncation=True,
                 max_length=self.max_seq_length,
             )
-            
-            # Prepare output - use input_ids as labels (standard SFT approach)
-            input_ids = inputs['input_ids'].squeeze(0) if 'input_ids' in inputs and inputs['input_ids'].numel() > 0 else torch.tensor([2], dtype=torch.long)
-            attention_mask = inputs.get('attention_mask', torch.ones(len(input_ids))).squeeze(0).long()
-            
-            # Labels: -100 for padding, actual token ids elsewhere
+
+            input_ids = (
+                inputs["input_ids"].squeeze(0)
+                if "input_ids" in inputs and inputs["input_ids"].numel() > 0
+                else torch.tensor([2], dtype=torch.long)
+            )
+            attention_mask = inputs.get("attention_mask", torch.ones(len(input_ids))).squeeze(0).long()
+
             labels = input_ids.clone()
             labels[attention_mask == 0] = -100
-            
-            # Mask user prompt in labels (so model only learns to predict assistant's response)
-            prompt_messages = [m for m in messages if m['role'] != 'assistant']
-            prompt_text = self.processor.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True)
+
+            prompt_messages = [message for message in messages if message["role"] != "assistant"]
+            prompt_text = self.processor.apply_chat_template(
+                prompt_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
             prompt_inputs = self.processor(
                 text=[prompt_text],
                 images=None,
@@ -222,60 +304,57 @@ class VideoSFTDataset(torch.utils.data.Dataset):
                 truncation=True,
                 max_length=self.max_seq_length,
             )
-            # Find the size of the prompt without padding
-            prompt_ids = prompt_inputs['input_ids'].squeeze(0)
+            prompt_ids = prompt_inputs["input_ids"].squeeze(0)
             prompt_length = len(prompt_ids)
             if prompt_length > 0:
-                # Mask the prompt so we only train on assistant output
                 labels[:prompt_length] = -100
-            
+
             result = {
-                'input_ids': input_ids,
-                'attention_mask': attention_mask,
-                'labels': labels,
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
             }
-            
-            # Add pixel/video values if present
-            for key in ['pixel_values', 'image_grid_thw', 'video_grid_thw']:
+
+            for key in ["pixel_values", "image_grid_thw", "video_grid_thw"]:
                 if key in inputs and inputs[key] is not None:
-                    val = inputs[key]
-                    if isinstance(val, torch.Tensor) and val.numel() > 0:
-                        result[key] = val.squeeze(0) if val.dim() > 1 else val
-            
+                    value = inputs[key]
+                    if isinstance(value, torch.Tensor) and value.numel() > 0:
+                        result[key] = value.squeeze(0) if value.dim() > 1 else value
+
             return result
-            
+
         except Exception as e:
             print(f"Error processing sample {idx}: {str(e)}")
-            # Return minimal valid batch
             if self.tokenizer:
                 tokens = self.tokenizer("", return_tensors="pt")
-                input_ids = tokens['input_ids'].squeeze(0)
+                input_ids = tokens["input_ids"].squeeze(0)
                 return {
-                    'input_ids': input_ids,
-                    'attention_mask': tokens['attention_mask'].squeeze(0).long(),
-                    'labels': input_ids.clone(),
+                    "input_ids": input_ids,
+                    "attention_mask": tokens["attention_mask"].squeeze(0).long(),
+                    "labels": input_ids.clone(),
                 }
-            else:
-                return {
-                    'input_ids': torch.tensor([2], dtype=torch.long),
-                    'attention_mask': torch.tensor([1], dtype=torch.long),
-                    'labels': torch.tensor([2], dtype=torch.long),
-                }
+
+            return {
+                "input_ids": torch.tensor([2], dtype=torch.long),
+                "attention_mask": torch.tensor([1], dtype=torch.long),
+                "labels": torch.tensor([2], dtype=torch.long),
+            }
 
 
 def setup_model_and_processor(model_args: ModelArguments):
     """Setup model with LoRA and processor."""
-    
+
+    compute_dtype = get_preferred_compute_dtype()
+    print(f"Model compute dtype: {compute_dtype}")
+
     if model_args.use_qlora:
-        # BitsAndBytes config for 4-bit quantization
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_compute_dtype=compute_dtype,
         )
-        
-        # Load model with QLoRA quantization
+
         model = AutoModelForImageTextToText.from_pretrained(
             model_args.model_name_or_path,
             quantization_config=bnb_config,
@@ -283,15 +362,13 @@ def setup_model_and_processor(model_args: ModelArguments):
             trust_remote_code=True,
         )
     else:
-        # Load model with bfloat16 for standard LoRA
         model = AutoModelForImageTextToText.from_pretrained(
             model_args.model_name_or_path,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=compute_dtype,
             device_map="auto",
             trust_remote_code=True,
         )
-    
-    # Setup LoRA
+
     if model_args.use_lora:
         lora_config = LoraConfig(
             r=model_args.lora_r,
@@ -303,100 +380,84 @@ def setup_model_and_processor(model_args: ModelArguments):
         )
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
-    
-    # Load processor
+
     processor = AutoProcessor.from_pretrained(
         model_args.model_name_or_path,
         trust_remote_code=True,
     )
-    
+
     return model, processor
 
 
 class DataCollatorForVideoSFT:
     """Collate function for video+text SFT batches with proper padding."""
-    
+
     def __init__(self, pad_token_id: int = 0):
         self.pad_token_id = pad_token_id
-    
+
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        # Process each item
-        batch_inputs = {}
-        
-        # Get max length for padding
         max_input_length = max(
-            item['input_ids'].shape[0] if isinstance(item['input_ids'], torch.Tensor) else len(item['input_ids'])
+            item["input_ids"].shape[0] if isinstance(item["input_ids"], torch.Tensor) else len(item["input_ids"])
             for item in batch
         )
-        
+
         input_ids_list = []
         attention_mask_list = []
         labels_list = []
-        
-        # Separate video/image tensors
         video_tensors = {}
-        
+
         for item in batch:
-            input_ids = item['input_ids'] if isinstance(item['input_ids'], torch.Tensor) else torch.tensor(item['input_ids'])
-            attention_mask = item.get('attention_mask', torch.ones_like(input_ids))
-            labels = item.get('labels', input_ids.clone())
-            
-            # Pad sequences
+            input_ids = item["input_ids"] if isinstance(item["input_ids"], torch.Tensor) else torch.tensor(item["input_ids"])
+            attention_mask = item.get("attention_mask", torch.ones_like(input_ids))
+            labels = item.get("labels", input_ids.clone())
+
             if input_ids.shape[0] < max_input_length:
                 pad_len = max_input_length - input_ids.shape[0]
                 input_ids = torch.cat([input_ids, torch.full((pad_len,), self.pad_token_id, dtype=torch.long)])
                 attention_mask = torch.cat([attention_mask, torch.zeros(pad_len, dtype=torch.long)])
                 labels = torch.cat([labels, torch.full((pad_len,), -100, dtype=torch.long)])
-            
+
             input_ids_list.append(input_ids)
             attention_mask_list.append(attention_mask)
             labels_list.append(labels)
-            
-            # Collect video/image tensors
-            for key in ['pixel_values', 'image_grid_thw', 'video_grid_thw', 'image_embeds', 'video_embeds']:
+
+            for key in ["pixel_values", "image_grid_thw", "video_grid_thw", "image_embeds", "video_embeds"]:
                 if key in item and item[key] is not None:
-                    if key not in video_tensors:
-                        video_tensors[key] = []
-                    video_tensors[key].append(item[key])
-        
+                    video_tensors.setdefault(key, []).append(item[key])
+
         result = {
-            'input_ids': torch.stack(input_ids_list),
-            'attention_mask': torch.stack(attention_mask_list),
-            'labels': torch.stack(labels_list),
+            "input_ids": torch.stack(input_ids_list),
+            "attention_mask": torch.stack(attention_mask_list),
+            "labels": torch.stack(labels_list),
         }
-        
-        # Add video tensors with padding if necessary
+
         for key, values in video_tensors.items():
-            if len(values) == len(batch):
-                try:
-                    if key in ['pixel_values', 'image_embeds', 'video_embeds']:
-                        # These might have different shapes, need to pad or concatenate properly
-                        result[key] = torch.cat(values, dim=0) if values[0].dim() > 0 else torch.stack(values)
-                    elif key in ['image_grid_thw', 'video_grid_thw']:
-                        # Ensure 2D shape (num_items, 3) for THW
-                        # If a single item is (3,), it should become (1, 3) before concat/stack
-                        values_2d = [v.unsqueeze(0) if v.dim() == 1 else v for v in values]
-                        result[key] = torch.cat(values_2d, dim=0)
-                    else:
-                        result[key] = torch.stack(values)
-                except (RuntimeError, ValueError) as e:
-                    print(f"Warning: Could not batch {key}: {e}")
-                    pass
-        
+            if len(values) != len(batch):
+                continue
+            try:
+                if key in ["pixel_values", "image_embeds", "video_embeds"]:
+                    result[key] = torch.cat(values, dim=0) if values[0].dim() > 0 else torch.stack(values)
+                elif key in ["image_grid_thw", "video_grid_thw"]:
+                    values_2d = [value.unsqueeze(0) if value.dim() == 1 else value for value in values]
+                    result[key] = torch.cat(values_2d, dim=0)
+                else:
+                    result[key] = torch.stack(values)
+            except (RuntimeError, ValueError) as e:
+                print(f"Warning: Could not batch {key}: {e}")
+
         return result
 
 
 class SFTTrainer(Trainer):
     """Custom trainer for SFT with video input."""
-    pass
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name_or_path", type=str, default="Qwen/Qwen3-VL-8b-Instruct")
-    parser.add_argument("--train_file", type=str, default="dataset/sim_dataset/train_sft.jsonl")
-    parser.add_argument("--val_file", type=str, default="dataset/sim_dataset/val_sft.jsonl")
-    parser.add_argument("--output_dir", type=str, default="./output/qwen3_vl_lora")
+    parser.add_argument("--model_name_or_path", type=str, default="Qwen/Qwen3-VL-8B-Instruct")
+    parser.add_argument("--train_file", type=str, default=str(DEFAULT_TRAIN_FILE))
+    parser.add_argument("--val_file", type=str, default=str(DEFAULT_VAL_FILE))
+    parser.add_argument("--output_dir", type=str, default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--num_train_epochs", type=int, default=3)
     parser.add_argument("--per_device_train_batch_size", type=int, default=1)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=1)
@@ -415,66 +476,86 @@ def main():
     parser.add_argument("--lora_r", type=int, default=64)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_target_modules", nargs="+", default=None)
-    
     args = parser.parse_args()
-    
-    # Setup model arguments
+
+    train_file = resolve_existing_path(args.train_file)
+    val_file = resolve_existing_path(args.val_file)
+    output_dir = resolve_output_path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    effective_bf16 = args.bf16
+    if effective_bf16 and (not torch.cuda.is_available() or not torch.cuda.is_bf16_supported()):
+        print("Warning: bf16 was requested but is not supported in the current CUDA environment. Falling back to bf16=False.")
+        effective_bf16 = False
+
+    if not torch.cuda.is_available():
+        print("Warning: CUDA is not available. QLoRA training may fail or be impractically slow on CPU.")
+
     model_args = ModelArguments(
         model_name_or_path=args.model_name_or_path,
         use_lora=args.use_lora,
         use_qlora=args.use_qlora,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
-        lora_target_modules=args.lora_target_modules
-        if args.lora_target_modules is not None
-        else ModelArguments.__dataclass_fields__["lora_target_modules"].default_factory(),
+        lora_target_modules=(
+            args.lora_target_modules
+            if args.lora_target_modules is not None
+            else ModelArguments.__dataclass_fields__["lora_target_modules"].default_factory()
+        ),
     )
-    
-    # Setup data arguments
+
     data_args = DataArguments(
-        train_file=args.train_file,
-        val_file=args.val_file,
+        train_file=str(train_file),
+        val_file=str(val_file),
         num_frames=args.num_frames,
         max_seq_length=args.max_seq_length,
     )
-    
+
     print("=" * 50)
+    print("Training configuration")
+    print("=" * 50)
+    print(f"Model: {model_args.model_name_or_path}")
+    print(f"Train JSONL: {train_file}")
+    print(f"Val JSONL: {val_file}")
+    print(f"Output dir: {output_dir}")
+    print(f"Use QLoRA: {model_args.use_qlora}")
+    print(f"Use LoRA: {model_args.use_lora}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"Visible GPUs: {torch.cuda.device_count()}")
+    print("=" * 50)
+
     print("Loading model and processor...")
-    print("=" * 50)
-    
     model, processor = setup_model_and_processor(model_args)
-    
+
     print("\n" + "=" * 50)
     print("Loading datasets...")
     print("=" * 50)
-    
-    # Load datasets
+
     train_dataset = VideoSFTDataset(
         jsonl_path=data_args.train_file,
         processor=processor,
         num_frames=data_args.num_frames,
         max_seq_length=data_args.max_seq_length,
     )
-    
+
     val_dataset = VideoSFTDataset(
         jsonl_path=data_args.val_file,
         processor=processor,
         num_frames=data_args.num_frames,
         max_seq_length=data_args.max_seq_length,
     )
-    
+
     print("\n" + "=" * 50)
     print("Setting up training...")
     print("=" * 50)
-    
-    # Data collator
+
     data_collator = DataCollatorForVideoSFT(
         pad_token_id=processor.tokenizer.pad_token_id or 0
     )
-    
-    # Training arguments
+
     training_args = TrainingArguments(
-        output_dir=args.output_dir,
+        output_dir=str(output_dir),
         num_train_epochs=args.num_train_epochs,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
@@ -490,13 +571,12 @@ def main():
         save_total_limit=3,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
-        bf16=args.bf16,
+        bf16=effective_bf16,
         ddp_find_unused_parameters=False,
         report_to=["tensorboard"],
         remove_unused_columns=False,
     )
-    
-    # Create trainer
+
     trainer = SFTTrainer(
         model=model,
         args=training_args,
@@ -504,22 +584,21 @@ def main():
         eval_dataset=val_dataset,
         data_collator=data_collator,
     )
-    
+
     print("\n" + "=" * 50)
     print("Starting training...")
     print("=" * 50)
-    
-    # Train
+
     trainer.train()
-    
+
     print("\n" + "=" * 50)
     print("Training complete!")
     print("=" * 50)
-    
-    # Save model
+
     if model_args.use_lora:
-        model.save_pretrained(os.path.join(args.output_dir, "final_lora_model"))
-        print(f"LoRA model saved to {os.path.join(args.output_dir, 'final_lora_model')}")
+        final_lora_dir = output_dir / "final_lora_model"
+        model.save_pretrained(final_lora_dir)
+        print(f"LoRA model saved to {final_lora_dir}")
 
 
 if __name__ == "__main__":
