@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Prepare SFT dataset for Qwen3-VL fine-tuning on CCTV accident detection.
 
@@ -20,7 +21,7 @@ from tqdm import tqdm
 
 
 def load_annotation(annotation_path: str, base_path: str = ".") -> Dict[str, Any]:
-    """Load annotation JSON file (handles both .json and .json.gz)."""
+    """비디오의 세부적인 주석(annotation) 데이터가 담긴 JSON 파일을 로드하는 함수"""
     full_path = os.path.join(base_path, annotation_path)
     
     # Handle .json.gz files - they are stored as directories with .json inside
@@ -57,7 +58,13 @@ def generate_why_description(
     vehicle_ids: List[int],
     accident_type: str
 ) -> str:
-    """Generate explanation for why this is the detected collision."""
+    """모델이 사고를 감지한 이유(why)에 대한 자연어 설명 문장을 만들어내는 함수"""
+
+    """
+    주석(annotation) 데이터에 포함된 충돌 프레임(iteration), 차량 ID(ids), 대상 바운딩 박스 중심 좌표, 사고 유형(accident_type) 정보를 조합합니다.
+    이를 통해 모델이 정답으로 출력하도록 유도할 구체적인 영문 설명
+    (예: "Vehicles (ID 1, 2) collided at frame 10 in the frame region around (400, 300). Type: head-on.")을 동적으로 생성합니다.
+    """
     
     if not annotation or "collision" not in annotation or not annotation["collision"]:
         return f"Detected {accident_type} collision based on visual analysis of the video."
@@ -102,7 +109,7 @@ def create_sft_sample(
     base_path: str,
     dataset_split: str = "train"
 ) -> Dict[str, Any]:
-    """Create a single SFT sample for one accident video."""
+    """하나의 사고 비디오 행(labels.csv 내 한 줄)을 받아 Qwen 모델 입출력 포맷에 맞춘 하나의 SFT 샘플로 구성하는 함수"""
     
     # Instruction prompt (from inference.py)
     instruction = (
@@ -149,6 +156,8 @@ def create_sft_sample(
     accident_time_val = row['accident_time']
     
     # Coordinates in GT: multiply by 1000 to match inference.py format
+    # labels.csv에는 0~1 사이의 실수로 저장되어 있음
+    # 1000을 곱한 이유는 0~1 사이 실수로 했을 시 모델이 소수점 아래 값들에 대해 학습하지 못할 가능성이 높아서 보정을 위함
     x1 = int(row['x1'] * 1000)
     y1 = int(row['y1'] * 1000)
     x2 = int(row['x2'] * 1000)
@@ -209,6 +218,16 @@ def prepare_dataset(
     max_samples: int = None,
     verbose: bool = True
 ) -> None:
+    """전체 데이터셋 데이터를 순회하며 실제 SFT 훈련 및 검증용 데이터를 만들고 파일로 저장하는 핵심 로직 함수"""
+    """
+    labels.csv를 읽어들인 뒤, 지정된 훈련 비율(train_ratio, 기본 0.9)에 맞춰 데이터를 훈련용(train)과 검증용(val)으로 나눕니다.
+tqdm을 사용해 진행 상황을 시각화하면서, 반복문을 통해 각 열마다 앞서 설명한 
+
+create_sft_sample
+을 호출하여 샘플들을 생성하고 모읍니다. 행을 처리하는 중 에러가 나는 샘플은 스킵(Skip)하도록 처리되어 있습니다.
+최종 수집된 훈련 샘플과 검증 샘플을 각각 지정된 디렉토리(output_dir)에 train_sft.jsonl 과 val_sft.jsonl 파일로 저장합니다.
+    """
+    
     """
     Prepare SFT dataset from labels.csv and annotations.
     

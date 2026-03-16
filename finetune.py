@@ -36,6 +36,22 @@ if hf_token:
     login(token=hf_token)
 
 
+def str2bool(value):
+    """Parse common string forms of booleans for argparse."""
+    if isinstance(value, bool):
+        return value
+
+    lowered = value.strip().lower()
+    if lowered in {"true", "t", "1", "yes", "y", "on"}:
+        return True
+    if lowered in {"false", "f", "0", "no", "n", "off"}:
+        return False
+
+    raise argparse.ArgumentTypeError(
+        f"Invalid boolean value: {value}. Use one of true/false, yes/no, 1/0."
+    )
+
+
 @dataclass
 class DataArguments:
     """Arguments for data configuration."""
@@ -393,11 +409,12 @@ def main():
     parser.add_argument("--eval_steps", type=int, default=100)
     parser.add_argument("--save_steps", type=int, default=100)
     parser.add_argument("--max_steps", type=int, default=-1)
-    parser.add_argument("--bf16", type=bool, default=True)
-    parser.add_argument("--use_lora", type=bool, default=True)
-    parser.add_argument("--use_qlora", type=bool, default=True)
+    parser.add_argument("--bf16", type=str2bool, default=True)
+    parser.add_argument("--use_lora", type=str2bool, default=True)
+    parser.add_argument("--use_qlora", type=str2bool, default=True)
     parser.add_argument("--lora_r", type=int, default=64)
     parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument("--lora_target_modules", nargs="+", default=None)
     
     args = parser.parse_args()
     
@@ -408,6 +425,9 @@ def main():
         use_qlora=args.use_qlora,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
+        lora_target_modules=args.lora_target_modules
+        if args.lora_target_modules is not None
+        else ModelArguments.__dataclass_fields__["lora_target_modules"].default_factory(),
     )
     
     # Setup data arguments

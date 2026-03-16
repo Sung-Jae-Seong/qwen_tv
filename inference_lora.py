@@ -18,6 +18,11 @@ hf_token = os.getenv("HF_TOKEN")
 if hf_token:
     login(token=hf_token)
 
+DEFAULT_MODEL_ID = "Qwen/Qwen3-VL-8b-Instruct"
+DEFAULT_TEST_PATH_FILE = "dataset/test_video_path.txt"
+DEFAULT_TRAIN_PATH_FILE = "dataset/train_video_path.txt"
+DEFAULT_EXPERIMENT_NAME = "lora_inference"
+
 
 def parse_in_json(llm_response, video_path):
     import re
@@ -92,12 +97,12 @@ def parse_in_json(llm_response, video_path):
     return temp
 
 
-def save_submission(submission, experiment_name, description_text=""):
+def save_submission(submission, experiment_name, description_text="", submission_filename="submission.csv"):
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     save_dir = os.path.join("result", f"{experiment_name}_{timestamp}")
     os.makedirs(save_dir, exist_ok=True)
 
-    submission_path = os.path.join(save_dir, "submission.csv")
+    submission_path = os.path.join(save_dir, submission_filename)
     description_path = os.path.join(save_dir, "description.txt")
 
     submission.to_csv(submission_path, index=False, lineterminator="\n")
@@ -148,10 +153,23 @@ class VideoInferenceVLM:
         raise NotImplementedError("Subclasses should implement this method.")
 
 
+def load_video_paths(video_path=None, video_list=None, source="test"):
+    if video_path:
+        return [video_path]
+
+    if video_list:
+        target_list = video_list
+    else:
+        target_list = DEFAULT_TRAIN_PATH_FILE if source == "train" else DEFAULT_TEST_PATH_FILE
+
+    with open(target_list, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+
 class Qwen3VLLoRAInference(VideoInferenceVLM):
     def __init__(
         self, 
-        model_id="Qwen/Qwen3-VL-8b-Instruct",
+        model_id=DEFAULT_MODEL_ID,
         lora_model_path="output/final_lora_model/final_lora_model",
         gpu_ids=None
     ):
@@ -311,7 +329,12 @@ class Qwen3VLLoRAInference(VideoInferenceVLM):
 
 def main():
     parser = argparse.ArgumentParser(description="Qwen-VL LoRA Inference")
+    parser.add_argument("--model_id", type=str, default=DEFAULT_MODEL_ID)
     parser.add_argument("--lora_model_path", type=str, default="/workspace/minseok/qwen_tv/output/final_lora_model/final_lora_model", help="Path to the LoRA adapter directory")
+    parser.add_argument("--source", type=str, choices=["test", "train"], default="test", help="Dataset split to run when --video_list is not provided")
+    parser.add_argument("--video_path", type=str, default=None, help="Single video path")
+    parser.add_argument("--video_list", type=str, default=None, help="Path to a text file containing video paths")
+    parser.add_argument("--experiment_name", type=str, default=DEFAULT_EXPERIMENT_NAME, help="Output directory prefix")
     args = parser.parse_args()
 
     mp.set_start_method("spawn", force=True)
@@ -350,21 +373,23 @@ example:
 }
 """
 
-    test_path_file = "dataset/test_video_path.txt"
-    # 절대 경로로 지정된 LoRA 모델 경로 적용
     lora_model_path = args.lora_model_path
     prompt = instruction + return_format
 
-    with open(test_path_file, "r", encoding="utf-8") as f:
-        video_paths = [line.strip() for line in f if line.strip()]
+    video_paths = load_video_paths(
+        video_path=args.video_path,
+        video_list=args.video_list,
+        source=args.source,
+    )
 
     print(f"Found {len(video_paths)} videos")
-    print(f"Processing first 4 videos with LoRA model...")
+    print(f"Source: {args.source}")
     print(f"LoRA path: {lora_model_path}\n")
     
     # Initialize inference once
     try:
         inference = Qwen3VLLoRAInference(
+            model_id=args.model_id,
             lora_model_path=lora_model_path,
             gpu_ids=[0, 1]
         )
@@ -409,7 +434,22 @@ example:
     # 결과를 submission CSV로 저장
     if results:
         submission = make_submission(results)
-        save_submission(submission, "lora_inference", f"LoRA model: {lora_model_path}\nTotal videos: {len(results)}\nElapsed: {total_elapsed_seconds:.2f}s")
+        submission_filename = "predictions_train.csv" if args.source == "train" else "submission.csv"
+        description = (
+            f"Source: {args.source}\n"
+            f"Model: {args.model_id}\n"
+            f"LoRA model: {lora_model_path}\n"
+            f"Total videos: {len(results)}\n"
+            f"Elapsed: {total_elapsed_seconds:.2f}s\n"
+            f"Video list: {args.video_list or ('dataset/train_video_path.txt' if args.source == 'train' else 'dataset/test_video_path.txt')}\n"
+            f"Output file: {submission_filename}\n"
+        )
+        save_submission(
+            submission,
+            args.experiment_name,
+            description,
+            submission_filename=submission_filename,
+        )
 
 
 if __name__ == "__main__":
