@@ -7,3 +7,7 @@ __pycache__/
 output/
 *.log
 memo.txt
+!README.md
+!output/grid_search/qlora_lr_1e-4_r_16_alpha_16_ep_5/*
+# Keep lightweight adapter metadata, but never commit LoRA weight blobs.
+output/grid_search/**/final_lora_model/adapter_model.safetensors
