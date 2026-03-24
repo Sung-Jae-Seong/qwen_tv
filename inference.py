@@ -12,12 +12,24 @@ from huggingface_hub import login
 from transformers import AutoProcessor, AutoModelForImageTextToText
 
 
+# .env에 HF_TOKEN이 있으면 Hugging Face 로그인까지 자동으로 수행한다.
+# 공개 모델만 쓸 때는 토큰이 없어도 import 단계에서 죽지 않도록 처리한다.
 load_dotenv()
 hf_token = os.getenv("HF_TOKEN")
-login(token=hf_token)
+if hf_token:
+    login(token=hf_token)
+else:
+    print("HF_TOKEN is not set. Continuing without Hugging Face login.", flush=True)
+
+
+DEFAULT_MODEL_ID = "Qwen/Qwen3-VL-8b-Instruct"
+DEFAULT_TEST_PATH_FILE = "dataset/test_video_path.txt"
+DEFAULT_EXPERIMENT_NAME = "qwen3_vl_inference"
 
 
 def parse_in_json(llm_response, video_path):
+    # 모델 응답을 Python literal/JSON 형태로 파싱하고,
+    # 실패 시에도 submission 생성을 이어갈 수 있도록 기본값을 넣는다.
     try:
         temp = ast.literal_eval(llm_response)
     except Exception:
@@ -40,6 +52,8 @@ def parse_in_json(llm_response, video_path):
     os.makedirs(save_dir, exist_ok=True)
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     save_path = os.path.join(save_dir, f"{video_name}.json")
+    # 원문 응답을 바로 쓰지 않고, 후처리된 JSON을 파일로 저장해
+    # 나중에 샘플별 디버깅과 오류 확인에 재사용한다.
     try:
         with open(save_path, "w", encoding="utf-8") as f:
             json.dump(temp, f, ensure_ascii=False, indent=2)
@@ -50,6 +64,8 @@ def parse_in_json(llm_response, video_path):
 
 
 def save_submission(submission, experiment_name, description_text=""):
+    # 실행 시각 기준으로 run 디렉터리를 만들고,
+    # submission.csv와 실행 메모(description.txt)를 함께 저장한다.
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     save_dir = os.path.join("result", f"{experiment_name}_{timestamp}")
     os.makedirs(save_dir, exist_ok=True)
@@ -66,6 +82,8 @@ def save_submission(submission, experiment_name, description_text=""):
 
 
 def make_submission(results):
+    # 파싱된 추론 결과를 대회 제출 포맷(path, time, center_x/y, type)으로 변환한다.
+    # 좌표는 bbox 중심점을 0~1 스케일로 맞추기 위해 1000으로 나눠 저장한다.
     rows = []
 
     for result in results:
@@ -88,23 +106,26 @@ def make_submission(results):
                 "center_y": center_y,
                 "type": accident_type
             })
-
-            submission = pd.DataFrame(
-                rows,
-                columns=["path", "accident_time", "center_x", "center_y", "type"]
-            )
-            return submission
         except Exception as e:
             print(f"failed to make submission for result: {result}, error: {e}")
-            return pd.DataFrame(columns=["path", "accident_time", "center_x", "center_y", "type"])
+
+    submission = pd.DataFrame(
+        rows,
+        columns=["path", "accident_time", "center_x", "center_y", "type"]
+    )
+    return submission
+
 
 class VideoInferenceVLM:
+    # 다른 비디오-언어 모델 구현체로 교체할 수 있게 둔 최소 인터페이스다.
     def video_inference(self, video_path, prompt, max_new_tokens=128):
         raise NotImplementedError("Subclasses should implement this method.")
 
 
 class Qwen3VLInference(VideoInferenceVLM):
-    def __init__(self, model_id="Qwen/Qwen3-VL-8b-Instruct", device="cuda:0"):
+    def __init__(self, model_id=DEFAULT_MODEL_ID, device="cuda:0"):
+        # 모델과 processor를 프로세스별로 한 번만 올리고,
+        # 이후에는 같은 GPU에서 여러 비디오를 순차 처리한다.
         self.device = device
         self.model = AutoModelForImageTextToText.from_pretrained(
             model_id,
@@ -114,6 +135,8 @@ class Qwen3VLInference(VideoInferenceVLM):
         self.processor = AutoProcessor.from_pretrained(model_id)
 
     def video_inference(self, video_path, prompt, max_new_tokens=128):
+        # Qwen3-VL chat template 형식에 맞춰
+        # 비디오 1개 + 텍스트 프롬프트를 하나의 대화 입력으로 구성한다.
         messages = [
             {
                 "role": "user",
@@ -130,6 +153,8 @@ class Qwen3VLInference(VideoInferenceVLM):
             }
         ]
 
+        # processor가 멀티모달 입력을 토큰화/텐서화하고,
+        # 최종 텐서는 현재 워커의 GPU로 이동시킨다.
         inputs = self.processor.apply_chat_template(
             messages,
             tokenize=True,
@@ -161,6 +186,8 @@ class Qwen3VLInference(VideoInferenceVLM):
 
 
 def worker_process(gpu_id, start_idx, end_idx, video_paths, prompt, output_queue):
+    # 워커 1개가 GPU 1개를 전담한다.
+    # 자신에게 할당된 video index 구간만 처리한 뒤, 결과를 queue로 메인 프로세스에 돌려준다.
     try:
         torch.cuda.set_device(gpu_id)
         inference = Qwen3VLInference(device=f"cuda:{gpu_id}")
@@ -203,8 +230,11 @@ def worker_process(gpu_id, start_idx, end_idx, video_paths, prompt, output_queue
 
 
 def main():
+    # CUDA + transformers 멀티프로세싱 안정성을 위해 spawn 방식을 강제한다.
     mp.set_start_method("spawn", force=True)
 
+    # 프롬프트는 충돌 시각, bbox, 사고 유형을 JSON 하나로 반환하도록 고정한다.
+    # 이 파일은 CoT를 길게 쓰기보다 제출 포맷에 맞는 구조화 출력에 집중한다.
     instruction = (
         "return the time when the collision occurs, "
         "and return the collision bounding box with left-top and right-bottom coordinates. "
@@ -239,40 +269,103 @@ example:
 }
 """
 
-    test_path_file = "dataset/test_video_path.txt"
+    test_path_file = DEFAULT_TEST_PATH_FILE
     prompt = instruction + return_format
 
+    # test_video_path.txt에 적힌 비디오 경로를 모두 읽는다.
     with open(test_path_file, "r", encoding="utf-8") as f:
         video_paths = [line.strip() for line in f if line.strip()]
 
-    total_videos = len(video_paths[:])
-    mid = total_videos // 2
+    total_videos = len(video_paths)
+    if total_videos == 0:
+        raise ValueError(f"No videos found in {test_path_file}")
+
+    # 보이는 GPU 수만큼 worker를 만들되,
+    # 비디오 개수보다 worker가 많아지는 경우는 피한다.
+    visible_gpu_count = torch.cuda.device_count()
+    if visible_gpu_count <= 0:
+        raise RuntimeError("No CUDA device is visible. inference.py requires at least one GPU.")
+
+    worker_count = min(visible_gpu_count, total_videos)
+    chunk_size = (total_videos + worker_count - 1) // worker_count
 
     output_queue = mp.Queue()
+    processes = []
 
-    process_0 = mp.Process(
-        target=worker_process,
-        args=(0, 0, mid, video_paths, prompt, output_queue)
-    )
-    process_1 = mp.Process(
-        target=worker_process,
-        args=(1, mid, total_videos, video_paths, prompt, output_queue)
-    )
+    # 전체 비디오 목록을 contiguous chunk로 나눠 worker에 배정한다.
+    for worker_index in range(worker_count):
+        start_idx = worker_index * chunk_size
+        end_idx = min(total_videos, start_idx + chunk_size)
+        if start_idx >= end_idx:
+            continue
+
+        process = mp.Process(
+            target=worker_process,
+            args=(worker_index, start_idx, end_idx, video_paths, prompt, output_queue)
+        )
+        processes.append(process)
 
     total_start_time = time.time()
 
-    process_0.start()
-    process_1.start()
+    for process in processes:
+        process.start()
 
-    worker_outputs = [output_queue.get(), output_queue.get()]
+    # 각 워커가 queue에 넣은 요약 결과를 수집한다.
+    worker_outputs = [output_queue.get() for _ in processes]
 
-    process_0.join()
-    process_1.join()
+    for process in processes:
+        process.join()
 
     total_end_time = time.time()
     total_elapsed_seconds = total_end_time - total_start_time
 
+    ordered_results = []
+    worker_errors = []
+    worker_summaries = []
+    for worker_output in worker_outputs:
+        worker_summaries.append(
+            f"gpu={worker_output['gpu_id']} range=[{worker_output['start_idx']}, {worker_output['end_idx']}) "
+            f"elapsed={worker_output['elapsed_seconds']:.2f}s error={worker_output['error']}"
+        )
+        if worker_output["error"] is not None:
+            worker_errors.append(
+                f"gpu {worker_output['gpu_id']} failed for range "
+                f"[{worker_output['start_idx']}, {worker_output['end_idx']}): {worker_output['error']}"
+            )
+        ordered_results.extend(worker_output["results"])
+
+    # 멀티프로세싱 결과는 순서가 섞일 수 있으므로 원래 video index 기준으로 다시 정렬한다.
+    ordered_results.sort(key=lambda item: item[0])
+    parsed_results = [payload for _, payload in ordered_results]
+    submission = make_submission(parsed_results)
+
+    # 실행 메타데이터를 description.txt에 남겨
+    # 어떤 환경과 분배 전략으로 돌렸는지 추적할 수 있게 한다.
+    description_lines = [
+        f"model_id: {DEFAULT_MODEL_ID}",
+        f"test_path_file: {test_path_file}",
+        f"visible_gpu_count: {visible_gpu_count}",
+        f"worker_count: {worker_count}",
+        f"total_videos: {total_videos}",
+        f"total_elapsed_seconds: {total_elapsed_seconds:.2f}",
+        "worker_outputs:",
+    ]
+    description_lines.extend(worker_summaries)
+    if worker_errors:
+        description_lines.append("errors:")
+        description_lines.extend(worker_errors)
+
+    save_submission(
+        submission,
+        experiment_name=DEFAULT_EXPERIMENT_NAME,
+        description_text="\n".join(description_lines) + "\n",
+    )
+
     print(f"Total elapsed time: {total_elapsed_seconds:.2f} seconds")
+    if worker_errors:
+        print("Some worker processes failed:", flush=True)
+        for error_text in worker_errors:
+            print(error_text, flush=True)
 
 
 if __name__ == "__main__":

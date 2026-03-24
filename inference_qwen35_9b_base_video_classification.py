@@ -25,6 +25,8 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
 
+# 실행 디렉터리를 기준으로 결과물과 데이터셋 기본 경로를 잡는다.
+# 별도 인자가 없으면 이 기본값들을 사용한다.
 REPO_ROOT = Path(__file__).resolve().parent
 RESULT_ROOT = REPO_ROOT / "result"
 DATASET_ROOT = REPO_ROOT / "dataset"
@@ -36,6 +38,8 @@ DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_BACKOFF_SEC = 5.0
 ASSISTANT_JSON_PREFIX = '{\n  "perception": {\n'
 
+# 프롬프트는 "첫 번째 실제 충돌"만 보고 사고 유형을 분류하도록 강하게 제약한다.
+# 특히 rear-end / sideswipe / single 구분이 흔들리지 않도록 기준을 자세히 적어둔다.
 SYSTEM_PROMPT = """You are an AI vision expert classifying CCTV traffic crashes using ANSI D16.1 and FMCSA-2022 crash classification standards.
 
 Your label must be based only on the first harmful event, meaning the exact first physical contact. Ignore approach behavior, near-misses, braking, swerving, and later post-impact motion.
@@ -132,6 +136,7 @@ def str2bool(value):
 
 
 def iter_candidate_paths(path_value: str, extra_bases: Optional[Iterable[Path]] = None):
+    # 사용자가 넘긴 상대 경로를 현재 작업 디렉터리, repo 루트, dataset 루트 기준으로 순차 탐색한다.
     path = Path(path_value).expanduser()
     if path.is_absolute():
         yield path
@@ -151,6 +156,8 @@ def iter_candidate_paths(path_value: str, extra_bases: Optional[Iterable[Path]] 
 
 
 def iter_relocated_absolute_paths(path_value: str, extra_bases: Optional[Iterable[Path]] = None):
+    # 다른 머신에서 생성된 절대 경로를 받았을 때도, repo 이름이나 dataset/videos 같은 공통 suffix를 이용해
+    # 현재 머신 경로로 "재배치"해서 찾아보려는 보조 루틴이다.
     path = Path(path_value).expanduser()
     if not path.is_absolute():
         return
@@ -248,6 +255,10 @@ def load_jobs(
     base_submission_csv: Optional[str],
     limit: Optional[int],
 ) -> Tuple[List[Dict[str, str]], Optional[pd.DataFrame], Optional[Path]]:
+    # 입력 모드는 3가지다.
+    # 1) 단일 비디오(--video_path)
+    # 2) 기존 submission CSV 기반 일괄 처리(--base_submission_csv)
+    # 3) path.txt 기반 일괄 처리(--video_list)
     if video_path:
         resolved = resolve_existing_path(video_path)
         jobs = [{"path": to_submission_path(str(resolved)), "video_path": str(resolved)}]
@@ -291,6 +302,8 @@ def try_parse_single_json(candidate: str) -> Optional[Dict[str, Any]]:
 
 
 def extract_json_dict(text: str) -> Optional[Dict[str, Any]]:
+    # 모델이 code block, 접두 텍스트, 부분 문자열 등을 섞어 내놓아도
+    # 최종적으로는 JSON 객체 하나를 최대한 복구해서 꺼내는 함수다.
     cleaned = text.strip()
     code_block = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", cleaned, re.DOTALL)
     if code_block:
@@ -307,6 +320,8 @@ def extract_json_dict(text: str) -> Optional[Dict[str, Any]]:
 
 
 def maybe_restore_prefilled_json(text: str) -> str:
+    # assistant prefill을 사용했기 때문에 출력이 '{' 없이 '"global"'부터 시작하는 경우가 있다.
+    # 이런 경우 앞부분을 복원해서 다시 JSON 파싱을 시도한다.
     stripped = text.lstrip()
     if stripped.startswith("{"):
         return text
@@ -316,6 +331,8 @@ def maybe_restore_prefilled_json(text: str) -> str:
 
 
 def normalize_accident_type(value: Any) -> Optional[str]:
+    # 모델이 "rear end", "rear-end", "angle", "single vehicle crash"처럼
+    # 조금씩 다른 표현을 내놔도 최종 라벨 5개 중 하나로 정규화한다.
     if value is None:
         return None
 
@@ -364,6 +381,11 @@ def try_parse_type_from_json(text: str) -> Optional[str]:
 
 
 def extract_structured_output_details(text: str) -> Dict[str, Any]:
+    # 원문 응답에서:
+    # - 복구된 JSON 전체
+    # - 최종 사고 유형
+    # - answer.why
+    # 를 한 번에 뽑아 후처리 단계에서 재사용한다.
     direct = extract_json_dict(text)
     if not isinstance(direct, dict):
         direct = extract_json_dict(maybe_restore_prefilled_json(text))
@@ -387,6 +409,8 @@ def extract_structured_output_details(text: str) -> Dict[str, Any]:
 
 
 def resolve_generation_device(model) -> torch.device:
+    # device_map="auto"를 쓸 때는 hf_device_map이 잡히므로,
+    # 실제 입력을 어느 디바이스로 보내야 하는지 모델 상태에서 역으로 계산한다.
     hf_device_map = getattr(model, "hf_device_map", None)
     if isinstance(hf_device_map, dict):
         for mapped_device in hf_device_map.values():
@@ -413,6 +437,8 @@ def move_inputs_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[s
 
 
 def sanitize_processor_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    # processor에 넘길 비디오 관련 kwargs에서 None/빈 리스트를 제거하고,
+    # 단일 원소 리스트로 들어온 값은 scalar로 정리해 transformers 쪽 오류를 줄인다.
     sanitized = {}
     for key, value in kwargs.items():
         if value is None:
@@ -427,6 +453,8 @@ def sanitize_processor_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def maybe_expand_video_grid_for_generation(inputs: Dict[str, Any]) -> Dict[str, Any]:
+    # qwen_vl_utils와 transformers가 video_grid_thw를 해석하는 방식이 어긋나는 경우가 있다.
+    # 멀티모달 토큰 그룹 수와 프레임 수를 비교해, 필요할 때만 [T, H, W]를 프레임 단위로 펼쳐 맞춘다.
     if "video_grid_thw" not in inputs or "mm_token_type_ids" not in inputs:
         return inputs
 
@@ -471,6 +499,8 @@ def generate_and_decode(
     temperature: float,
     top_p: float,
 ) -> str:
+    # sampling 여부는 temperature로만 제어한다.
+    # temperature=0이면 deterministic decode, 그 외에는 top-p sampling을 켠다.
     pad_token_id = processor.tokenizer.pad_token_id
     if pad_token_id is None:
         pad_token_id = processor.tokenizer.eos_token_id
@@ -500,6 +530,8 @@ def generate_and_decode(
 
 
 def build_direct_video_messages(video_path: str) -> List[Dict[str, Any]]:
+    # 이번 스크립트는 비디오 파일 경로를 직접 모델 입력으로 넘긴다.
+    # OpenAI/vLLM endpoint를 쓰는 버전과 달리 URL 서버를 따로 띄우지 않는다.
     return [
         {
             "role": "system",
@@ -520,6 +552,7 @@ def build_direct_video_messages(video_path: str) -> List[Dict[str, Any]]:
 
 
 def save_raw_and_parsed_response(run_dir: Path, path_value: str, raw_text: str, parsed: Dict[str, Any]):
+    # 디버깅을 위해 원문 응답(txt)과 후처리 결과(json)를 둘 다 저장한다.
     stem = Path(path_value).stem or "unknown"
     with open(run_dir / "raw_responses" / f"{stem}.txt", "w", encoding="utf-8") as handle:
         handle.write(raw_text)
@@ -556,6 +589,8 @@ def replace_type_in_submission(
     *,
     fallback_to_existing_type: bool,
 ) -> pd.DataFrame:
+    # 기존 submission의 다른 컬럼은 유지하고, type만 이번 예측 결과로 치환한다.
+    # 실패 샘플은 옵션에 따라 기존 type을 유지할 수 있다.
     output_df = base_submission_df.copy()
     replaced_types = []
     for row in output_df.to_dict("records"):
@@ -573,6 +608,7 @@ def replace_type_in_submission(
 
 
 class Qwen35BaseVideoClassificationRunner:
+    # 모델/프로세서를 한 번만 올려두고, 비디오별 infer()만 반복 호출하는 실행기 객체.
     def __init__(
         self,
         *,
@@ -612,6 +648,8 @@ class Qwen35BaseVideoClassificationRunner:
         if attn_implementation.lower() != "auto" and "attn_implementation" in from_pretrained_signature:
             model_kwargs["attn_implementation"] = attn_implementation
 
+        # local_files_only=true면 로컬 캐시에 이미 받아둔 모델만 사용한다.
+        # false면 Hugging Face에서 새로 다운로드할 수 있다.
         print(f"Loading processor from: {model_name_or_path}", flush=True)
         self.processor = AutoProcessor.from_pretrained(model_name_or_path, **processor_kwargs)
         print(f"Loading model from: {model_name_or_path}", flush=True)
@@ -625,6 +663,9 @@ class Qwen35BaseVideoClassificationRunner:
         print(f"Input device: {self.input_device}", flush=True)
 
     def infer(self, *, video_path: str, max_new_tokens: int, temperature: float, top_p: float) -> str:
+        # 1) 비디오/텍스트를 대화 형식 메시지로 구성
+        # 2) processor가 요구하는 video/image tensor로 변환
+        # 3) generation 후 새로 생성된 토큰만 decode
         messages = build_direct_video_messages(video_path)
         prompt_text = self.processor.apply_chat_template(
             messages,
@@ -666,6 +707,8 @@ class Qwen35BaseVideoClassificationRunner:
 
 
 def parse_args():
+    # inference_qwen35_9b_base_video_classification.py는
+    # 단일 비디오 / path list / base submission CSV 중 하나를 받아 일괄 처리할 수 있다.
     parser = argparse.ArgumentParser(description="Base Qwen3.5-9B full-video classification inference")
     parser.add_argument("--model_name_or_path", type=str, default=DEFAULT_MODEL_ID)
     parser.add_argument("--video_path", type=str, default=None)
@@ -686,6 +729,13 @@ def parse_args():
 
 
 def main():
+    # 전체 흐름:
+    # 1) 입력 비디오 목록 확정
+    # 2) 결과 저장 디렉터리 생성
+    # 3) 모델 1회 로딩
+    # 4) 비디오별 추론 + 재시도
+    # 5) raw/parsed 결과 저장
+    # 6) type_predictions.csv 및 (선택 시) submission_replace_only_type.csv 저장
     args = parse_args()
     jobs, base_submission_df, resolved_base_submission_csv = load_jobs(
         video_path=args.video_path,
@@ -737,6 +787,8 @@ def main():
 
         for attempt in range(1, args.max_retries + 1):
             try:
+                # 모델 응답이 항상 완전한 JSON은 아니므로,
+                # 추론 직후 JSON 복구/정규화 단계를 바로 거친다.
                 raw_text = runner.infer(
                     video_path=video_path,
                     max_new_tokens=args.max_new_tokens,
@@ -832,6 +884,7 @@ def main():
         handle.write(description)
 
     if base_submission_df is not None:
+        # base submission을 입력으로 받았을 때만 type 컬럼 교체본을 추가 생성한다.
         replaced_submission_df = replace_type_in_submission(
             base_submission_df,
             type_by_path,
