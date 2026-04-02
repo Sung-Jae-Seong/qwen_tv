@@ -239,3 +239,19 @@ If you want to hand this to someone else, share the whole `deploy/` folder plus 
 
 - a local model snapshot path, or
 - a note that the model should be downloaded from Hugging Face.
+
+## Run command example
+```bash
+CUDA_VISIBLE_DEVICES=6,7 nohup python3 inference_qwen35_9b_base_video_classification_two_stage.py \
+  --local_files_only true \
+  --base_submission_csv /home/milab/cvpr2026cctv/team01/minseok/qwen_tv/submission_rian_standard.csv \
+  --stage1_predictions_csv /home/milab/cvpr2026cctv/team01/minseok/qwen_tv/result/qwen35_9b_two_stage_stage1full_stage2clip_fps8_gpu67_v5_20260329110839/submission_replace_only_type_stage1.csv \
+  --use_submission_time_clip true \
+  --clip_seconds_before 3.0 \
+  --clip_seconds_after 3.0 \
+  --video_fps 8 \
+  --video_max_frames 1024 \
+  --stage2_max_new_tokens 96 \
+  --experiment_name qwen35_9b_stage2_only_rerun_gpu67 \
+  > /home/milab/cvpr2026cctv/team01/minseok/qwen_tv/infer_qwen35_9b_stage2_v5_only_rerun_gpu67.log 2>&1 &
+```
